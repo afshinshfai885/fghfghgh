@@ -5,12 +5,20 @@ import sqlite3
 import time
 from telethon import TelegramClient, events
 from telethon.errors import PersistentTimestampOutdatedError, FloodWaitError
-
 # ===================== تنظیمات اصلی =====================
 API_ID = 22487790
 API_HASH = "09c24af20084de9372cc92a760c74961"
 
 GROUP_ID = -1003979242735
+
+# گروه‌های اضافه — فقط rescue listener توشون فعاله (پیام ارسال نمیشه)
+EXTRA_GROUPS = [
+    -1003979242735,
+    -1002305033993,
+    -1003329545310,
+    -1002401888484,
+    -1002352251108
+]
 
 SESSION_NAME = "my_account_session"
 DB_FILE = "timers.db"
@@ -29,9 +37,9 @@ WAIT_FOR_BUTTON_SECONDS = 15
 # ---- تنظیمات بخش "ماهیگیری" ----
 FISHING_INTERVAL_SECONDS = 40 * 60
 FISHING_TEXT = "ماهی"
-FISH_VALUE_THRESHOLD = 700
 SELL_FISH_BUTTON = "فروش ماهی"
 GIVE_TO_CAT_BUTTON = "بده پیشی بخوره"
+STOMACH_THRESHOLD = 8  # زیر 8 → بده پیشی بخوره | 8 به بالا → فروش ماهی
 
 # ---- دکمه نجات پیشی ----
 RESCUE_BUTTON_TEXT = "نجات پیشی خیابونی 🐱"
@@ -40,10 +48,9 @@ RESCUE_BUTTON_TEXT = "نجات پیشی خیابونی 🐱"
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 
-# ===================== دیتابیس تایمر =====================
+# ===================== دیتابیس =====================
 
 def init_db():
-    """ساخت جدول تایمر اگه وجود نداشت"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
@@ -52,12 +59,18 @@ def init_db():
             last_run REAL NOT NULL
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS cat_stats (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            stomach INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    c.execute("INSERT OR IGNORE INTO cat_stats (id, stomach) VALUES (1, 0)")
     conn.commit()
     conn.close()
 
 
 def get_last_run(key: str) -> float:
-    """آخرین زمان اجرای یه تایمر رو برمیگردونه (epoch)، اگه نبود 0"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT last_run FROM timers WHERE key = ?", (key,))
@@ -67,7 +80,6 @@ def get_last_run(key: str) -> float:
 
 
 def set_last_run(key: str, ts: float):
-    """آخرین زمان اجرا رو ذخیره می‌کنه"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
@@ -78,15 +90,28 @@ def set_last_run(key: str, ts: float):
     conn.close()
 
 
+def get_stomach() -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT stomach FROM cat_stats WHERE id = 1")
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def set_stomach(value: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE cat_stats SET stomach = ? WHERE id = 1", (value,))
+    conn.commit()
+    conn.close()
+    print(f"[i] شکم ذخیره شد: {value}")
+
+
 def seconds_until_next(key: str, interval: float) -> float:
-    """
-    چقدر باید صبر کنیم تا نوبت بعدی؟
-    اگه از آخرین اجرا interval ثانیه گذشته باشه → 0 (یعنی الان بزن)
-    وگرنه → چقدر مونده
-    """
     last = get_last_run(key)
     if last == 0.0:
-        return 0.0  # اولین اجرا، همین الان بزن
+        return 0.0
     elapsed = time.time() - last
     remaining = interval - elapsed
     return max(0.0, remaining)
@@ -104,7 +129,7 @@ async def safe_send(group_id, text, retries=3):
             await asyncio.sleep(e.seconds + 5)
         except PersistentTimestampOutdatedError:
             wait = 10 * (attempt + 1)
-            print(f"[!] PersistentTimestampOutdated: {wait} ثانیه صبر می‌کنم... ({attempt+1}/{retries})")
+            print(f"[!] PersistentTimestampOutdated: {wait} ثانیه... ({attempt+1}/{retries})")
             await asyncio.sleep(wait)
         except Exception as e:
             print(f"[!] خطا در ارسال: {e}")
@@ -121,7 +146,7 @@ async def safe_iter_messages(group_id, limit=5):
             return messages
         except PersistentTimestampOutdatedError:
             wait = 10 * (attempt + 1)
-            print(f"[!] PersistentTimestampOutdated هنگام خواندن پیام: {wait} ثانیه...")
+            print(f"[!] PersistentTimestampOutdated هنگام خواندن: {wait} ثانیه...")
             await asyncio.sleep(wait)
         except Exception as e:
             print(f"[!] خطا در خواندن پیام: {e}")
@@ -129,13 +154,32 @@ async def safe_iter_messages(group_id, limit=5):
     return []
 
 
+def parse_stomach(text: str):
+    """
+    از متن پیام پیشی، عدد شکم رو استخراج میکنه.
+    مثال: 🍖 شکم : 😻 عاشقتمیووو (`10` / `10`)
+    عدد اول رو برمیگردونه (مقدار فعلی)
+    """
+    match = re.search(r"شکم\s*:.*?`(\d+)`\s*/\s*`\d+`", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def is_target_bot(msg, sender) -> bool:
+    sender_username = getattr(sender, "username", None)
+    return (
+        str(msg.sender_id) == str(TARGET_BOT).lstrip("@")
+        or (sender_username and f"@{sender_username}" == TARGET_BOT)
+    )
+
+
 # ===================== حلقه‌های اصلی =====================
 
 async def send_meow_loop():
-    """هر 280 ثانیه یه پیام رندوم میو می‌فرسته، با حافظه تایمر"""
     wait = seconds_until_next("meow", MEOW_INTERVAL_SECONDS)
     if wait > 0:
-        print(f"[~] میو: {wait:.0f} ثانیه مونده تا نوبت بعدی...")
+        print(f"[~] میو: {wait:.0f} ثانیه مونده...")
         await asyncio.sleep(wait)
 
     while True:
@@ -148,10 +192,9 @@ async def send_meow_loop():
 
 
 async def send_pishi_and_click_loop():
-    """هر 40 دقیقه پیشی + کلیک دکمه، با حافظه تایمر"""
     wait = seconds_until_next("pishi", PISHI_INTERVAL_SECONDS)
     if wait > 0:
-        print(f"[~] پیشی: {wait:.0f} ثانیه مونده تا نوبت بعدی...")
+        print(f"[~] پیشی: {wait:.0f} ثانیه مونده...")
         await asyncio.sleep(wait)
 
     while True:
@@ -171,13 +214,16 @@ async def send_pishi_and_click_loop():
                     if msg.sender_id is None or not msg.buttons:
                         continue
                     sender = await msg.get_sender()
-                    sender_username = getattr(sender, "username", None)
-                    is_target = (
-                        str(msg.sender_id) == str(TARGET_BOT).lstrip("@")
-                        or (sender_username and f"@{sender_username}" == TARGET_BOT)
-                    )
-                    if not is_target:
+                    if not is_target_bot(msg, sender):
                         continue
+
+                    # --- پارس و ذخیره شکم ---
+                    msg_text = msg.text or ""
+                    stomach_val = parse_stomach(msg_text)
+                    if stomach_val is not None:
+                        set_stomach(stomach_val)
+
+                    # --- کلیک دکمه برداشت ---
                     for row in msg.buttons:
                         for button in row:
                             if button.text.strip() == BUTTON_TEXT:
@@ -200,10 +246,9 @@ async def send_pishi_and_click_loop():
 
 
 async def send_fishing_loop():
-    """هر 40 دقیقه ماهی + کلیک شرطی، با حافظه تایمر"""
     wait = seconds_until_next("fishing", FISHING_INTERVAL_SECONDS)
     if wait > 0:
-        print(f"[~] ماهی: {wait:.0f} ثانیه مونده تا نوبت بعدی...")
+        print(f"[~] ماهی: {wait:.0f} ثانیه مونده...")
         await asyncio.sleep(wait)
 
     while True:
@@ -223,29 +268,29 @@ async def send_fishing_loop():
                     if msg.sender_id is None or not msg.buttons:
                         continue
                     sender = await msg.get_sender()
-                    sender_username = getattr(sender, "username", None)
-                    is_target = (
-                        str(msg.sender_id) == str(TARGET_BOT).lstrip("@")
-                        or (sender_username and f"@{sender_username}" == TARGET_BOT)
-                    )
-                    if not is_target:
+                    if not is_target_bot(msg, sender):
                         continue
-                    text = msg.text or ""
+
                     button_texts = {b.text.strip() for row in msg.buttons for b in row}
                     if not ({SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON} & button_texts):
                         continue
-                    match = re.search(r"ارزش\s*[:：]\s*`?([\d,]+)`?", text)
-                    if not match:
-                        print(f"[!] ارزش ماهی پیدا نشد. متن: {text}")
-                        continue
-                    fish_value = int(match.group(1).replace(",", ""))
-                    print(f"[i] ارزش ماهی: {fish_value}")
-                    target_button = SELL_FISH_BUTTON if fish_value >= FISH_VALUE_THRESHOLD else GIVE_TO_CAT_BUTTON
+
+                    # --- تصمیم بر اساس شکم ---
+                    stomach = get_stomach()
+                    print(f"[i] شکم فعلی: {stomach}")
+
+                    if stomach < STOMACH_THRESHOLD:
+                        target_button = GIVE_TO_CAT_BUTTON
+                        print(f"[i] شکم {stomach} < {STOMACH_THRESHOLD} → '{GIVE_TO_CAT_BUTTON}'")
+                    else:
+                        target_button = SELL_FISH_BUTTON
+                        print(f"[i] شکم {stomach} >= {STOMACH_THRESHOLD} → '{SELL_FISH_BUTTON}'")
+
                     for row in msg.buttons:
                         for button in row:
                             if button.text.strip() == target_button:
                                 await msg.click(text=target_button)
-                                print(f"[+] کلیک '{target_button}' (ارزش={fish_value})")
+                                print(f"[+] کلیک '{target_button}' (شکم={stomach})")
                                 handled = True
                                 break
                         if handled:
@@ -262,67 +307,65 @@ async def send_fishing_loop():
         await asyncio.sleep(FISHING_INTERVAL_SECONDS)
 
 
+# ===================== Rescue Listener (همه گروه‌ها) =====================
+
 async def rescue_listener():
     """
-    لیسنر پیام‌های جدید گروه:
-    اگه پیام جدیدی از TARGET_BOT اومد و دکمه 'نجات پیشی خیابونی' داشت،
-    اون دکمه رو بزن تا کاملاً بره (حلقه می‌زنه تا دکمه دیگه نباشه)
+    تو GROUP_ID + همه EXTRA_GROUPS گوش میده.
+    اگه پیامی از TARGET_BOT با دکمه نجات پیشی اومد، سریع کلیک میکنه
+    تا دکمه کاملاً از بین بره.
     """
-    @client.on(events.NewMessage(chats=GROUP_ID))
+    all_groups = [GROUP_ID] + EXTRA_GROUPS
+
+    @client.on(events.NewMessage(chats=all_groups))
     async def handler(event):
         msg = event.message
         if not msg.buttons:
             return
 
-        # چک کن فرستنده همون بات باشه
         sender = await msg.get_sender()
-        sender_username = getattr(sender, "username", None)
-        is_target = (
-            str(msg.sender_id) == str(TARGET_BOT).lstrip("@")
-            or (sender_username and f"@{sender_username}" == TARGET_BOT)
-        )
-        if not is_target:
+        if not is_target_bot(msg, sender):
             return
 
-        # دنبال دکمه نجات بگرد
         button_texts = {b.text.strip() for row in msg.buttons for b in row}
         if RESCUE_BUTTON_TEXT not in button_texts:
             return
 
-        print(f"[!] دکمه '{RESCUE_BUTTON_TEXT}' پیدا شد! شروع به کلیک...")
+        chat_id = event.chat_id
+        print(f"[!] دکمه '{RESCUE_BUTTON_TEXT}' پیدا شد! (گروه: {chat_id}) شروع کلیک...")
 
-        # حلقه بزن تا دکمه کاملاً بره
         while True:
             try:
-                # پیام رو رفرش کن تا ببینیم هنوز دکمه داره
-                fresh = await client.get_messages(GROUP_ID, ids=msg.id)
+                fresh = await client.get_messages(chat_id, ids=msg.id)
                 if not fresh or not fresh.buttons:
-                    print(f"[+] دکمه '{RESCUE_BUTTON_TEXT}' دیگه نیست، تموم شد.")
+                    print(f"[+] دکمه '{RESCUE_BUTTON_TEXT}' دیگه نیست.")
                     break
 
                 current_texts = {b.text.strip() for row in fresh.buttons for b in row}
                 if RESCUE_BUTTON_TEXT not in current_texts:
-                    print(f"[+] دکمه '{RESCUE_BUTTON_TEXT}' دیگه نیست، تموم شد.")
+                    print(f"[+] دکمه '{RESCUE_BUTTON_TEXT}' دیگه نیست.")
                     break
 
                 await fresh.click(text=RESCUE_BUTTON_TEXT)
-                print(f"[+] کلیک روی '{RESCUE_BUTTON_TEXT}'")
-                await asyncio.sleep(1.5)  # کمی صبر بین کلیک‌ها
+                print(f"[+] کلیک روی '{RESCUE_BUTTON_TEXT}' (گروه: {chat_id})")
+                await asyncio.sleep(1.5)
 
             except Exception as e:
                 print(f"[!] خطا در حلقه نجات: {e}")
                 break
 
-    # نگه‌دار لیسنر رو فعال نگه‌دار (این تابع هرگز تموم نمیشه)
     await client.run_until_disconnected()
 
+
+# ===================== Main =====================
 
 async def main():
     init_db()
     await client.start()
     me = await client.get_me()
     print(f"[+] وارد شدی به عنوان: {me.first_name} (@{me.username})")
-    print("[+] اسکریپت شروع به کار کرد. برای توقف Ctrl+C بزن.\n")
+    print(f"[+] شکم فعلی تو DB: {get_stomach()}")
+    print("[+] اسکریپت شروع شد. Ctrl+C برای توقف.\n")
 
     await asyncio.gather(
         send_meow_loop(),
