@@ -29,13 +29,12 @@ RESCUE_BUTTON_TEXT = "نجات پیشی خیابونی 🐱"
 PISHI_BUTTON_TEXT  = "برداشت میو پوینت ها"
 SELL_FISH_BUTTON   = "فروش ماهی"
 GIVE_TO_CAT_BUTTON = "بده پیشی بخوره"
-WAIT_FOR_BOT       = 20   # ثانیه انتظار برای جواب بات
+WAIT_FOR_BOT       = 20
 # ══════════════════════════════════════════════════
 
 client       = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 active_group = PRIMARY_GROUP
 
-# chat_id → (msg_id, msg_text) — برای ادیت کردن پیام قبلی
 last_panel_msg: dict[int, tuple[int, str]] = {}
 
 
@@ -119,14 +118,14 @@ async def safe_send(gid, text, retries=3):
     global active_group
     for attempt in range(retries):
         try:
-            await client.send_message(gid, text)
-            return True
+            msg = await client.send_message(gid, text)
+            return msg   # ← پیام ارسال‌شده رو برمیگردونه
         except BLOCKED as e:
             print(f"[!] بلاک از {gid}: {type(e).__name__}")
             if gid == PRIMARY_GROUP and active_group == PRIMARY_GROUP:
                 active_group = FALLBACK_GROUP
                 print(f"[~] سوییچ به fallback: {FALLBACK_GROUP}")
-            return False
+            return None
         except FloodWaitError as e:
             print(f"[!] FloodWait {e.seconds}s")
             await asyncio.sleep(e.seconds + 5)
@@ -134,7 +133,7 @@ async def safe_send(gid, text, retries=3):
             await asyncio.sleep(10 * (attempt + 1))
         except Exception as e:
             print(f"[!] خطا ارسال: {e}"); await asyncio.sleep(5)
-    return False
+    return None
 
 def is_bot(msg, sender) -> bool:
     uname = getattr(sender, "username", None)
@@ -145,20 +144,22 @@ def parse_stomach(text: str):
     m = re.search(r"شکم\s*:.*?`(\d+)`\s*/\s*`\d+`", text)
     return int(m.group(1)) if m else None
 
-async def wait_for_bot_msg(gid: int, after_ts: float, has_buttons: set, timeout: int = WAIT_FOR_BOT):
+
+async def wait_for_reply(gid: int, my_msg_id: int, has_buttons: set, timeout: int = WAIT_FOR_BOT):
     """
-    منتظر میشه تا پیامی از TARGET_BOT با دکمه‌های مشخص بعد از after_ts بیاد.
-    برمیگردونه پیام یا None.
+    فقط پیامی رو قبول می‌کنه که:
+    - از TARGET_BOT باشه
+    - reply_to_msg_id اون دقیقاً برابر my_msg_id باشه
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         await asyncio.sleep(1)
         try:
-            async for msg in client.iter_messages(gid, limit=8):
+            async for msg in client.iter_messages(gid, limit=10):
                 if not msg.buttons or not msg.sender_id:
                     continue
-                if msg.date.timestamp() < after_ts - 2:
-                    break  # پیام‌های قدیمی‌ترن، دیگه نگرد
+                if not msg.reply_to or msg.reply_to.reply_to_msg_id != my_msg_id:
+                    continue
                 sender = await msg.get_sender()
                 if not is_bot(msg, sender):
                     continue
@@ -168,7 +169,7 @@ async def wait_for_bot_msg(gid: int, after_ts: float, has_buttons: set, timeout:
         except PersistentTimestampOutdatedError:
             await asyncio.sleep(5)
         except Exception as e:
-            print(f"[!] خطا در wait_for_bot_msg: {e}")
+            print(f"[!] خطا در wait_for_reply: {e}")
             await asyncio.sleep(2)
     return None
 
@@ -216,8 +217,8 @@ def build_help() -> str:
         "└─────────────────────\n\n"
         "🐟  **منطق ماهی**\n"
         "┌─────────────────────\n"
-        f"│  شکم < `/stomach` → بده پیشی بخوره\n"
-        f"│  شکم ≥ `/stomach` → فروش ماهی\n"
+        "│  شکم < `/stomach` → بده پیشی بخوره\n"
+        "│  شکم ≥ `/stomach` → فروش ماهی\n"
         "└─────────────────────"
     )
 
@@ -228,7 +229,6 @@ def build_status() -> str:
     threshold = int(cfg("stomach"))
     stomach   = get_stomach()
     fish_action = SELL_FISH_BUTTON if stomach >= threshold else GIVE_TO_CAT_BUTTON
-
     return (
         "╔══════════════════════╗\n"
         "║   🐱  Afshin Self    ║\n"
@@ -262,9 +262,7 @@ def build_timers() -> str:
         f"🎣  ماهی   ─  `{fmt_time(secs_left('fishing', fi))}`"
     )
 
-
 async def panel_reply(event, text: str):
-    """ادیت پیام قبلی اگه وجود داشت، وگرنه پیام جدید"""
     chat_id = event.chat_id
     info    = last_panel_msg.get(chat_id)
     if info:
@@ -277,10 +275,9 @@ async def panel_reply(event, text: str):
             except Exception:
                 pass
         else:
-            return  # متن یکسانه، ادیت لازم نیست
+            return
     msg = await client.send_message(chat_id, text)
     last_panel_msg[chat_id] = (msg.id, text)
-
 
 async def handle_command(event):
     raw = (event.message.text or "").strip()
@@ -296,7 +293,6 @@ async def handle_command(event):
         await panel_reply(event, build_status()); return
     if cmd in ("t", "timers"):
         await panel_reply(event, build_timers()); return
-
     if cmd in KEYS:
         if not rest:
             await panel_reply(event, f"❌  مقدار بده:\n`/{cmd} مقدار`"); return
@@ -306,7 +302,6 @@ async def handle_command(event):
         emoji = KEYS[cmd][0]
         await panel_reply(event, f"✅  {emoji} `{cmd}` = `{rest}` ذخیره شد.")
         return
-
     await panel_reply(event, "❓  دستور ناشناس.\n`/help` بزن.")
 
 
@@ -326,10 +321,10 @@ async def meow_loop():
         choices  = [x.strip() for x in cfg("meow_list").split(",") if x.strip()]
         text     = random.choice(choices)
         target   = active_group
-        ok = await safe_send(target, text)
-        if not ok and target == PRIMARY_GROUP and active_group == FALLBACK_GROUP:
-            ok = await safe_send(FALLBACK_GROUP, text)
-        if ok:
+        sent = await safe_send(target, text)
+        if not sent and target == PRIMARY_GROUP and active_group == FALLBACK_GROUP:
+            sent = await safe_send(FALLBACK_GROUP, text)
+        if sent:
             set_last_run("meow", time.time())
             print(f"[+] میو '{text}' → {active_group}")
         await asyncio.sleep(interval)
@@ -347,17 +342,16 @@ async def pishi_loop():
         pishi_text = cfg("pishi_msg")
         try:
             target = active_group
-            ok = await safe_send(target, pishi_text)
-            if not ok and target == PRIMARY_GROUP and active_group == FALLBACK_GROUP:
-                ok = await safe_send(FALLBACK_GROUP, pishi_text)
-            if not ok:
+            sent = await safe_send(target, pishi_text)
+            if not sent and target == PRIMARY_GROUP and active_group == FALLBACK_GROUP:
+                sent = await safe_send(FALLBACK_GROUP, pishi_text)
+            if not sent:
                 await asyncio.sleep(interval); continue
 
-            sent_ts = time.time()
-            set_last_run("pishi", sent_ts)
-            print(f"[+] پیشی → {active_group} | منتظر جواب بات...")
+            set_last_run("pishi", time.time())
+            print(f"[+] پیشی → {active_group} (id={sent.id}) | منتظر ریپلای بات...")
 
-            msg = await wait_for_bot_msg(active_group, sent_ts, {PISHI_BUTTON_TEXT})
+            msg = await wait_for_reply(active_group, sent.id, {PISHI_BUTTON_TEXT})
             if msg:
                 sv = parse_stomach(msg.text or "")
                 if sv is not None:
@@ -385,20 +379,16 @@ async def fishing_loop():
         threshold = int(cfg("stomach"))
         try:
             target = active_group
-            ok = await safe_send(target, fish_text)
-            if not ok and target == PRIMARY_GROUP and active_group == FALLBACK_GROUP:
-                ok = await safe_send(FALLBACK_GROUP, fish_text)
-            if not ok:
+            sent = await safe_send(target, fish_text)
+            if not sent and target == PRIMARY_GROUP and active_group == FALLBACK_GROUP:
+                sent = await safe_send(FALLBACK_GROUP, fish_text)
+            if not sent:
                 await asyncio.sleep(interval); continue
 
-            sent_ts = time.time()
-            set_last_run("fishing", sent_ts)
-            print(f"[+] ماهی → {active_group} | منتظر جواب بات...")
+            set_last_run("fishing", time.time())
+            print(f"[+] ماهی → {active_group} (id={sent.id}) | منتظر ریپلای بات...")
 
-            msg = await wait_for_bot_msg(
-                active_group, sent_ts,
-                {SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON}
-            )
+            msg = await wait_for_reply(active_group, sent.id, {SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON})
             if msg:
                 stomach    = get_stomach()
                 target_btn = GIVE_TO_CAT_BUTTON if stomach < threshold else SELL_FISH_BUTTON
@@ -413,26 +403,22 @@ async def fishing_loop():
 
 
 # ══════════════════════════════════════════════════
-#  Rescue Listener — سریع‌ترین حالت ممکن
+#  Rescue Listener
 # ══════════════════════════════════════════════════
 
 async def rescue_listener():
     @client.on(events.NewMessage(chats=RESCUE_GROUPS))
     async def handler(event):
         msg = event.message
-        if not msg.buttons:
-            return
+        if not msg.buttons: return
         btn_texts = {b.text.strip() for row in msg.buttons for b in row}
-        if RESCUE_BUTTON_TEXT not in btn_texts:
-            return
+        if RESCUE_BUTTON_TEXT not in btn_texts: return
         sender = await msg.get_sender()
-        if not is_bot(msg, sender):
-            return
+        if not is_bot(msg, sender): return
 
         chat_id = event.chat_id
         print(f"[!!!] نجات پیشی! گروه {chat_id} — کلیک فوری...")
 
-        # کلیک اول: همین الان، بدون هیچ تاخیری
         for attempt in range(3):
             try:
                 await msg.click(text=RESCUE_BUTTON_TEXT)
@@ -442,7 +428,6 @@ async def rescue_listener():
                 print(f"[!] کلیک {attempt+1} خطا: {e}")
                 await asyncio.sleep(0.2)
 
-        # حلقه بعدی با تاخیر 0.3s تا دکمه کاملاً بره
         await asyncio.sleep(0.3)
         while True:
             try:
