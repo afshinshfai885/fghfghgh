@@ -27,7 +27,7 @@ DB_FILE      = "timers.db"
 TARGET_BOT         = "@MeowieQBot"
 RESCUE_BUTTON_TEXT = "نجات پیشی خیابونی 🐱"
 PISHI_BUTTON_TEXT  = "برداشت میو پوینت ها"
-SELL_FISH_BUTTON   = "فروش ماهی"        # بر اساس تایید شما روی همین مقدار تنظیم شد
+SELL_FISH_BUTTON   = "فروش ماهی"
 GIVE_TO_CAT_BUTTON = "بده پیشی بخوره"
 WAIT_FOR_BOT       = 25 
 # ══════════════════════════════════════════════════
@@ -37,7 +37,6 @@ active_group  = PRIMARY_GROUP
 my_first_name = ""
 my_username   = ""
 
-# دیکشنری جهانی برای ردیابی آنی پاسخ‌های ربات در گپ‌های شلوغ
 pending_responses = {}
 
 # ══════════════════════════════════════════════════
@@ -110,7 +109,7 @@ def fmt_time(s: float) -> str:
     return f"{s//3600} ساعت و {(s%3600)//60} دقیقه"
 
 # ══════════════════════════════════════════════════
-#  توابع پردازشی و کمکی هماهنگ با پیام‌های جدید
+#  توابع پردازشی کاملاً بهینه‌سازی شده خط‌به‌خط
 # ══════════════════════════════════════════════════
 
 BLOCKED = (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError)
@@ -142,29 +141,21 @@ def is_bot(msg, sender) -> bool:
             or (uname and f"@{uname}" == TARGET_BOT))
 
 def parse_stomach(text: str):
-    """ استخراج فوق العاده دقیق سطح شکم از هر دو ساختار متنی جدید و قدیم ربات """
-    # فیلتر اول: ساختار جدید پرانتزی مانند (6 / 10)
-    m1 = re.search(r"شکم\s*:\s*.*?\(\s*(\d+)\s*/\s*\d+\s*\)", text)
-    if m1:
-        return int(m1.group(1))
-    # فیلتر دوم: ساختار قدیمی با کدها و علامت بک‌تیک
-    m2 = re.search(r"شکم\s*:.*?`(\d+)`\s*/\s*`\d+`", text)
-    if m2:
-        return int(m2.group(1))
-    # فیلتر سوم: جستجوی عمومی در صورت وجود کلمه شکم
-    m3 = re.search(r"(\d+)\s*/\s*\d+", text)
-    if m3 and "شکم" in text:
-        return int(m3.group(1))
+    """ استخراج ۱۰۰٪ تضمینی سطح شکم به صورت خط‌به‌خط بدون تداخل با اموجی‌ها """
+    if not text:
+        return None
+    for line in text.split('\n'):
+        if "شکم" in line:
+            match = re.search(r"(\d+)\s*/\s*\d+", line)
+            if match:
+                return int(match.group(1))
     return None
 
 async def wait_for_bot_response(chat_id: int, my_msg_id: int, timeout: int = WAIT_FOR_BOT):
-    """ مکانیزم نوین مبتنی بر Future جهت دریافت آنی پیام بدون گم شدن در شلوغی گپ """
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
-    
     key = (chat_id, my_msg_id)
     pending_responses[key] = fut
-    
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
@@ -173,7 +164,7 @@ async def wait_for_bot_response(chat_id: int, my_msg_id: int, timeout: int = WAI
         pending_responses.pop(key, None)
 
 # ══════════════════════════════════════════════════
-#  بخش ساخت رابط کاربری حرفه‌ای پنل مدیریتی (Premium UI)
+#  بخش ساخت پنل کاربری مدیریتی
 # ══════════════════════════════════════════════════
 
 KEYS = {
@@ -190,7 +181,6 @@ NUMERIC_KEYS = {"meow_sec", "pishi_sec", "fish_sec", "stomach"}
 def build_help() -> str:
     return (
         "👑 **پـنـل مـدیـریـت پـیـشـرفته ربـات پـیـشـی** 👑\n"
-        "✨ `UI ورژن جدید و ارتقا یافته سلف‌بات` ✨\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "📊 **مشاهده وضعیت سیستم:**\n"
         "🔹 `/s` ↤ نمایش وضعیت زنده و آمار شکم\n"
@@ -266,7 +256,7 @@ async def handle_command(event):
             if not rest:
                 await event.edit(f"⚠️ **مقدار وارد نشده است!**\nفرمت صحیح: `/{cmd} مقدار جدید`"); return
             if cmd in NUMERIC_KEYS and not rest.isdigit():
-                await event.edit(f"❌ **خطای اعتبارسنجی:** مقدار پارامتر `{cmd}` الزاماً باید عدد باشد."); return
+                await event.edit(f"❌ **خطای اعتبارسنجی:** مقدار پارامتر `{cmd}` باید عدد باشد."); return
             
             cfg_set(cmd, rest)
             emoji = KEYS[cmd][0]
@@ -276,7 +266,7 @@ async def handle_command(event):
         print(f"[!] خطا در ادیت خودکار دستور: {e}")
 
 # ══════════════════════════════════════════════════
-#  حلقه‌های اصلی خودکار اتوماسیون بازی
+#  حلقه‌های خودکار اصلی بازی
 # ══════════════════════════════════════════════════
 
 async def meow_loop():
@@ -316,23 +306,27 @@ async def pishi_loop():
                 await asyncio.sleep(interval); continue
 
             set_last_run("pishi", time.time())
-            print(f"[+] دستور پیشی ارسال شد | منتظر دریافت پاسخ اختصاصی...")
+            print(f"[+] دستور پیشی ارسال شد | منتظر پاسخ...")
 
             msg = await wait_for_bot_response(active_group, sent.id, timeout=WAIT_FOR_BOT)
             if msg:
+                # تایید نهایی پردازش شکم در صورت دریافت پیام
                 sv = parse_stomach(msg.text or "")
                 if sv is not None:
                     set_stomach(sv)
-                    print(f"[i] سطح شکم با موفقیت به روزرسانی شد: {sv}")
+                    print(f"[i] تایید سطح شکم در چرخه: {sv}")
                 
-                for row in msg.buttons:
-                    for b in row:
-                        if PISHI_BUTTON_TEXT in b.text:
-                            await b.click()
-                            print(f"[+] روی دکمه '{PISHI_BUTTON_TEXT}' کلیک شد.")
-                            break
+                if msg.buttons:
+                    for row in msg.buttons:
+                        for b in row:
+                            if PISHI_BUTTON_TEXT in b.text:
+                                await b.click()
+                                print(f"[+] دکمه '{PISHI_BUTTON_TEXT}' کلیک شد.")
+                                break
+                else:
+                    print("[i] پیام پروفایل دریافت شد (در این لحظه دکمه برداشتی وجود ندارد).")
             else:
-                print("[!] پیام ربات برای برداشت پوینت‌ها یافت نشد یا منقضی شد.")
+                print("[!] پیام وضعیت پیشی در زمان معین دریافت نشد.")
         except Exception as e:
             print(f"[!] خطا در حلقه پیشی: {e}")
         await asyncio.sleep(interval)
@@ -356,41 +350,44 @@ async def fishing_loop():
                 await asyncio.sleep(interval); continue
 
             set_last_run("fishing", time.time())
-            print(f"[+] دستور ماهی ارسال شد | منتظر پاسخ اختصاصی...")
+            print(f"[+] دستور ماهی ارسال شد | منتظر پاسخ...")
 
             msg = await wait_for_bot_response(active_group, sent.id, timeout=WAIT_FOR_BOT)
             if msg:
                 stomach    = get_stomach()
                 target_btn = GIVE_TO_CAT_BUTTON if stomach < threshold else SELL_FISH_BUTTON
-                print(f"[i] وضعیت تصمیم‌گیری ماهیگیری: شکم={stomach} آستانه={threshold} -> دکمه هدف: {target_btn}")
+                print(f"[i] آنالیز ماهیگیری: شکم={stomach} آستانه={threshold} -> دکمه هدف: {target_btn}")
                 
-                # خواندن خودکار هوشمند ارزش غذایی برای آپدیت در لحظه شکم دیتابیس
                 nutritional_value = 0
-                if target_btn == GIVE_TO_CAT_BUTTON:
-                    m_nut = re.search(r"ارزش غذایی\s*:\s*(\d+)", msg.text or "")
-                    if m_nut:
-                        nutritional_value = int(m_nut.group(1))
+                for line in (msg.text or "").split('\n'):
+                    if "ارزش غذایی" in line:
+                        m_nut = re.search(r"(\d+)", line)
+                        if m_nut:
+                            nutritional_value = int(m_nut.group(1))
 
-                clicked = False
-                for row in msg.buttons:
-                    for b in row:
-                        if target_btn in b.text:
-                            await b.click()
-                            print(f"[+] کلیک روی دکمه '{target_btn}' با موفقیت انجام شد.")
-                            if target_btn == GIVE_TO_CAT_BUTTON and nutritional_value > 0:
-                                set_stomach(stomach + nutritional_value)
-                                print(f"[i] شکم به صورت محلی افزایش یافت: {stomach + nutritional_value}")
-                            clicked = True
-                            break
-                    if clicked: break
+                if msg.buttons:
+                    clicked = False
+                    for row in msg.buttons:
+                        for b in row:
+                            if target_btn in b.text:
+                                await b.click()
+                                print(f"[+] کلیک روی دکمه '{target_btn}' انجام شد.")
+                                if target_btn == GIVE_TO_CAT_BUTTON and nutritional_value > 0:
+                                    set_stomach(stomach + nutritional_value)
+                                    print(f"[i] به روزرسانی هوشمند شکم در دیتابیس: {stomach + nutritional_value}")
+                                clicked = True
+                                break
+                        if clicked: break
+                else:
+                    print("[!] پیام ماهیگیری دکمه ندارد!")
             else:
-                print("[!] پیام ماهیگیری ربات در زمان معین دریافت نشد.")
+                print("[!] پیام پاسخ ماهیگیری دریافت نشد.")
         except Exception as e:
             print(f"[!] خطا در حلقه ماهیگیری: {e}")
         await asyncio.sleep(interval)
 
 # ══════════════════════════════════════════════════
-#  شنود هوشمند و مرکزی پیام‌های ورودی گپ (Rescue & Router)
+#  شنود هوشمند مرکزی (Rescue & Router)
 # ══════════════════════════════════════════════════
 
 async def fast_click(msg, text):
@@ -405,67 +402,59 @@ async def fast_click(msg, text):
     return False
 
 async def central_message_listener():
-    """ هندلر مرکزی برای شکار سریع دکمه نجات و هدایت پاسخ‌ها بدون تاخیر زمان‌بندی """
     @client.on(events.NewMessage(chats=RESCUE_GROUPS))
     async def handler(event):
         msg = event.message
         if not msg.sender_id: return
         
-        # تایید اصالت فرستنده (حتما ربات اصلی بازی باشد)
         sender = await msg.get_sender()
         if not is_bot(msg, sender): return
 
-        # ۱. بخش واکنش فوق سریع به دکمه نجات پیشی خیابونی (بخش موازی صدم ثانیه‌ای)
+        text_content = msg.text or ""
+
+        # ۱. دکمه نجات پیشی خیابونی (فوق سریع و بدون وابستگی)
         if msg.buttons:
             btn_texts = {b.text.strip() for row in msg.buttons for b in row}
             if any(RESCUE_BUTTON_TEXT in txt for txt in btn_texts):
-                print(f"[🚀] نجات پیشی ظاهر شد! ارسال کلیک‌های موازی با حداکثر سرعت...")
+                print(f"[🚀] نجات پیشی ظاهر شد! ارسال کلیک...")
                 await asyncio.gather(
                     fast_click(msg, RESCUE_BUTTON_TEXT),
                     fast_click(msg, RESCUE_BUTTON_TEXT),
                     fast_click(msg, RESCUE_BUTTON_TEXT)
                 )
-                
-                # بررسی ثانویه جهت اطمینان کامل از برداشته شدن دکمه نجات
-                await asyncio.sleep(0.4)
-                for _ in range(3):
-                    try:
-                        fresh = await client.get_messages(event.chat_id, ids=msg.id)
-                        if not fresh or not fresh.buttons: break
-                        cur = {b.text.strip() for row in fresh.buttons for b in row}
-                        if not any(RESCUE_BUTTON_TEXT in txt for txt in cur): break
-                        await fast_click(fresh, RESCUE_BUTTON_TEXT)
-                        await asyncio.sleep(0.4)
-                    except:
-                        break
                 return
 
-        # ۲. ردیاب هوشمند حلقه پیشی و ماهیگیری بر اساس Reply ID یا منشن نام شما
-        if msg.reply_to:
-            rep_id = msg.reply_to.reply_to_msg_id
-            key = (event.chat_id, rep_id)
+        # ۲. بررسی تعلق پیام به اکانت ما و آزادکردن تردها
+        is_for_me = False
+        
+        if msg.reply_to_msg_id:
+            key = (event.chat_id, msg.reply_to_msg_id)
             if key in pending_responses:
+                is_for_me = True
                 fut = pending_responses[key]
                 if not fut.done():
                     fut.set_result(msg)
-                    return
+        
+        if not is_for_me:
+            if (my_first_name and my_first_name in text_content) or (my_username and my_username in text_content):
+                is_for_me = True
+                for k, fut in list(pending_responses.items()):
+                    if k[0] == event.chat_id and not fut.done():
+                        fut.set_result(msg)
+                        break
 
-        # فیلتر ثانویه بک‌آپ بر اساس نام و وجود دکمه‌های کنترلی بازی
-        if msg.buttons:
-            btn_texts = {b.text.strip() for row in msg.buttons for b in row}
-            has_game_buttons = any(b in btn_texts for b in [PISHI_BUTTON_TEXT, SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON])
-            if has_game_buttons:
-                text_content = msg.text or ""
-                if (my_first_name and my_first_name in text_content) or (my_username and my_username in text_content):
-                    for k, fut in list(pending_responses.items()):
-                        if k[0] == event.chat_id and not fut.done():
-                            fut.set_result(msg)
-                            return
+        # ۳. اسکن آنی شکم در صورت احراز هویت پیام (حتی اگر پیام دکمه نداشته باشد)
+        if is_for_me:
+            if "شکم" in text_content:
+                sv = parse_stomach(text_content)
+                if sv is not None:
+                    set_stomach(sv)
+                    print(f"[i] شکار موفق آمار شکم از پیام ربات: {sv}")
 
     await client.run_until_disconnected()
 
 # ══════════════════════════════════════════════════
-#  شنود دستورات ارسالی خود کاربر (Command Listener)
+#  شنود دستورات کنترل پنل کاربر
 # ══════════════════════════════════════════════════
 
 async def command_listener():
@@ -478,7 +467,7 @@ async def command_listener():
         await asyncio.sleep(3600)
 
 # ══════════════════════════════════════════════════
-#  تابع اصلی راه اندازی (Main)
+#  اجرا
 # ══════════════════════════════════════════════════
 
 async def main():
@@ -486,14 +475,13 @@ async def main():
     init_db()
     await client.start()
     
-    # دریافت مشخصات شما برای احراز هویت پیام‌ها در گپ شلوغ
     me = await client.get_me()
     my_first_name = me.first_name or ""
     my_username   = me.username or ""
     
-    print(f"[+] سلف بات با موفقیت به اکانت متصل شد: {my_first_name}")
-    print(f"[+] سیستم مانیتورینگ رویداد پیشرفته و زنده با موفقیت فعال گردید.")
-    print(f"[+] آماده دریافت دستورات! دستور /help را ارسال نمایید.\n")
+    print(f"[+] سلف بات فعال شد روی اکانت: {my_first_name}")
+    print(f"[+] مانیتورینگ خط‌به‌خط و بدون دکمه با موفقیت مستقر شد.")
+    print(f"[+] آماده به کار! دستور /help را ارسال نمایید.\n")
 
     await asyncio.gather(
         meow_loop(),
