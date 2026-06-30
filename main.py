@@ -10,7 +10,7 @@ from telethon.errors import PersistentTimestampOutdatedError, FloodWaitError
 API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
-GROUP_ID = -1003979242735
+GROUP_ID = -1003380347106
 
 EXTRA_GROUPS = [
 ]
