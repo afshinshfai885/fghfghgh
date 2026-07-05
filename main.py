@@ -120,7 +120,7 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 # ══════════════════════════════════════════════════
 #  لایه دیتابیس
 # ══════════════════════════════════════════════════
-
+print("power by afshin")
 @contextmanager
 def db_cursor() -> Iterator[sqlite3.Cursor]:
     """کانتکست‌منیجر امن برای اتصال به دیتابیس — همیشه commit/close تضمین می‌شود."""
