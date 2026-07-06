@@ -13,7 +13,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Optional, Iterator, Tuple
-
+from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon import TelegramClient, events
 from telethon.tl.custom.message import Message
 from telethon.errors import (
@@ -547,6 +547,52 @@ async def click_by_text(msg: Message, text: str) -> bool:
     except Exception as e:
         log.warning(f"[BUTTON] کلیک متنی '{text}' ناموفق — {e}")
         return False
+    
+
+
+async def bypass_click(msg: Message, button_text: str) -> bool:
+    """
+    این تابع دکمه را بر اساس متن پیدا کرده و مستقیماً 
+    کال‌بک‌دیتای آن را به تلگرام تزریق می‌کند.
+    """
+    if not msg.buttons:
+        return False
+
+    for row in msg.buttons:
+        for btn in row:
+            if button_text in btn.text:
+                cb_data = getattr(btn.button, 'data', None)
+                
+                if cb_data:
+                    try:
+                        log.info(f"⚡ [BYPASS] شلیک مستقیم به دکمه: {btn.text}")
+                        await client(GetBotCallbackAnswerRequest(
+                            peer=msg.peer_id,
+                            msg_id=msg.id,
+                            data=cb_data,
+                            password=None
+                        ))
+                        log.info(f"✅ [SUCCESS] دکمه «{btn.text}» با موفقیت دور زده شد.")
+                        return True
+                    except Exception as e:
+                        log.error(f"❌ خطا در ارسال Bypass برای '{btn.text}': {e}")
+                        return False
+                else:
+                    log.warning(f"⚠️ دکمه '{btn.text}' دیتای مخفی ندارد، تلاش برای کلیک عادی...")
+                    await btn.click()
+                    return True
+    
+    log.warning(f"🔍 دکمه‌ای با متن '{button_text}' در این پیام یافت نشد.")
+    return False
+
+async def click_by_text(msg: Message, text: str) -> bool:
+    """کلیک ایمن فقط با متن دکمه — برای مواردی که ایندکس دقیق مشخص نیست (مثل «انبار»)."""
+    try:
+        await msg.click(text=text)
+        return True
+    except Exception as e:
+        log.warning(f"[BUTTON] کلیک متنی '{text}' ناموفق — {e}")
+        return False
 
 
 def _first_button_text(msg: Message) -> str:
@@ -875,7 +921,7 @@ async def pishi_loop() -> None:
                 if sv is not None:
                     set_stomach(sv)
                     log.info(f"[PISHI] شکم به‌روزرسانی شد: {sv}")
-                await msg.click(text=PISHI_BUTTON_TEXT)
+                await bypass_click(msg, PISHI_BUTTON_TEXT)
                 log.info("[PISHI] Button Clicked")
             else:
                 log.warning("[PISHI] دکمه پاسخ پیدا نشد.")
@@ -911,16 +957,23 @@ async def fishing_loop() -> None:
             set_last_run("fishing", time.time())
             log.info(f"[FISH] پیام ارسال شد → {target} (id={sent.id}) | منتظر پاسخ بات...")
 
+
             msg = await wait_for_reply(target, sent.id, {SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON})
             if msg:
                 stomach = get_stomach()
                 target_btn = GIVE_TO_CAT_BUTTON if stomach < threshold else SELL_FISH_BUTTON
                 log.info(f"[FISH] شکم={stomach} آستانه={threshold} → '{target_btn}'")
-                await msg.click(text=target_btn)
-                if target_btn == SELL_FISH_BUTTON:
-                    log.info("[FISH] Fish Sold")
+                
+                # استفاده از بای‌پس کلیک به جای کلیک عادی
+                success = await bypass_click(msg, target_btn)
+                
+                if success:
+                    if target_btn == SELL_FISH_BUTTON:
+                        log.info("[FISH] ✅ ماهی با موفقیت فروخته شد (Bypass).")
+                    else:
+                        log.info("[FISH] ✅ ماهی با موفقیت به پیشی داده شد (Bypass).")
                 else:
-                    log.info("[FISH] Fish Given To Cat")
+                    log.warning(f"[FISH] ❌ کلیک مخفی روی '{target_btn}' ناموفق بود.")
             else:
                 log.warning("[FISH] پیام پاسخ پیدا نشد.")
         except Exception as e:
