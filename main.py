@@ -8,14 +8,14 @@ import asyncio
 import logging
 import random
 import re
-import os
 import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Optional, Iterator, Tuple
-from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+
 from telethon import TelegramClient, events
 from telethon.tl.custom.message import Message
+from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon.errors import (
     PersistentTimestampOutdatedError,
     FloodWaitError,
@@ -44,7 +44,7 @@ API_HASH = "09c24af20084de9372cc92a760c74961"
 SESSION_NAME = "my_account_session"
 DB_FILE      = "data/timers.db"
 
-TARGET_BOT = "@MeowieeeQBot"
+TARGET_BOTS = {"MeowieQBot", "MeowieeQBot", "MeowieeeQBot", "MeowieQIVBot", "MeowieQVBot"}
 
 RESCUE_BUTTON_TEXT = "نجات پیشی خیابونی 🐱"
 PISHI_BUTTON_TEXT  = "برداشت میو پوینت ها"
@@ -61,9 +61,9 @@ MENU_TRIGGER = ".سلف"
 
 # مقادیر پیش‌فرض گروه‌ها (فقط برای اولین اجرا / ساخت دیتابیس)
 DEFAULT_RESCUE_GROUPS = [-1003184246310, -1003180169065, -1004296149068]
-DEFAULT_MEOW_GROUP    = -1003979242735
-DEFAULT_FISH_GROUP    = -1003979242732
-DEFAULT_PISHI_GROUP   = -1003979242732
+DEFAULT_MEOW_GROUP    = -1003380347106
+DEFAULT_FISH_GROUP    = -1003180169065
+DEFAULT_PISHI_GROUP   = -1003180169065
 DEFAULT_SMUGGLING_GROUP = -1003979242735
 DEFAULT_FACTORY_GROUP   = -1003979242735
 
@@ -87,7 +87,7 @@ SMUGGLE_MAX_STEPS     = 40   # سقف تلاش داخلی هر سیکل — جل
 SMUGGLE_RETRY_DELAY   = 30   # ثانیه — تاخیر تلاش مجدد در صورت خطا/وضعیت ناشناخته
 SMUGGLE_RESTART_DELAY = 5    # ثانیه — تاخیر کوتاه قبل از شروع مجدد بعد از زندان/دریافت کارمزد
 FACTORY_RETRY_DELAY   = 60   # ثانیه — تاخیر تلاش مجدد کارخونه در صورت خطا
-FACTORY_INITIAL_DELAY = 10  # ۵ دقیقه — فقط در اولین اجرای کاملاً تازه (بدون سابقه در دیتابیس)
+FACTORY_INITIAL_DELAY = 300  # ۵ دقیقه — فقط در اولین اجرای کاملاً تازه (بدون سابقه در دیتابیس)
 
 # مقادیر پیش‌فرض تنظیمات عددی/متنی
 DEFAULT_CONFIG = {
@@ -97,7 +97,7 @@ DEFAULT_CONFIG = {
     "fish_sec":  "1500",
     "stomach":   "7",
     "smuggling_min":      "5",
-    "smuggling_max":      "5",
+    "smuggling_max":      "15",
     "min_sell_price":     "55",
     "smuggling_wait_sec": "1800",
     "factory_wait_sec":   "3600",
@@ -120,7 +120,7 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 # ══════════════════════════════════════════════════
 #  لایه دیتابیس
 # ══════════════════════════════════════════════════
-print("power by afshin")
+
 @contextmanager
 def db_cursor() -> Iterator[sqlite3.Cursor]:
     """کانتکست‌منیجر امن برای اتصال به دیتابیس — همیشه commit/close تضمین می‌شود."""
@@ -148,7 +148,6 @@ def table_count(table: str) -> int:
 
 
 def init_db() -> None:
-    os.makedirs("data", exist_ok=True)
     """ساخت جداول در صورت نبود، درج مقادیر پیش‌فرض، و چاپ لاگ کامل وضعیت دیتابیس."""
     log.info(f"[DB] مسیر دیتابیس: {DB_FILE}")
     try:
@@ -371,11 +370,12 @@ async def safe_send(gid: int, text: str, retries: int = 3) -> Optional[Message]:
 
 
 def is_bot(msg: Message, sender) -> bool:
+    """
+    True اگر فرستنده یکی از بات‌های آینه (TARGET_BOTS) باشد — چون این بازی چند بات
+    مشابه در گروه‌های مختلف دارد و هرکدام که در آن گروه فعال باشد باید شناسایی شود.
+    """
     uname = getattr(sender, "username", None)
-    return (
-        str(msg.sender_id) == TARGET_BOT.lstrip("@")
-        or (uname and f"@{uname}" == TARGET_BOT)
-    )
+    return bool(uname) and uname in TARGET_BOTS
 
 
 def parse_stomach(text: str) -> Optional[int]:
@@ -396,24 +396,24 @@ def _normalize(text: Optional[str]) -> str:
 
 
 def parse_street_cats(text: str) -> Optional[int]:
-    """🐈 شما XXX پیشی خیابونی آماده برای قاچاق دارید"""
-    m = re.search(r"شما\s+(\d+)\s+پیشی\s+خیابونی(?:\s+آماده\s+برای\s+قاچاق)?\s+دارید", _normalize(text))
+    """🐈 شما XXX پیشی خیابونی دارید"""
+    m = re.search(r"شما\s+(\d+)\s+پیشی\s+خیابونی\s+دارید", _normalize(text))
     return int(m.group(1)) if m else None
 
+
 def parse_smuggle_count(text: str) -> Optional[Tuple[int, int]]:
-    """✨ تعداد پیشی های قاچاقی : X / 15"""
-    m = re.search(r"تعداد\s+پیشی\s+های\s+قاچاقی\s*:\s*(\d+)\s*/\s*(\d+)", _normalize(text))
+    """✨ تعداد پیشی های قاچاقی : X / 15  →  (X, 15)"""
+    m = re.search(r"تعداد\s*پیشی\s*های\s*قاچاقی\s*:\s*(\d+)\s*/\s*(\d+)", _normalize(text))
     return (int(m.group(1)), int(m.group(2))) if m else None
 
+
 def parse_duration(text: str) -> Optional[int]:
-    """استخراج زمان HH:MM:SS از متن (زمان مورد نیاز قاچاق/کارخونه) و تبدیل آن به ثانیه + ۳ دقیقه حاشیه امنیت."""
+    """استخراج زمان HH:MM:SS از متن (زمان مورد نیاز قاچاق/کارخونه) و تبدیل آن به ثانیه."""
     m = DURATION_RE.search(_normalize(text))
     if not m:
         return None
     h, mn, s = (int(x) for x in m.groups())
-    
-    total_seconds = h * 3600 + mn * 60 + s
-    return total_seconds + 60
+    return h * 3600 + mn * 60 + s
 
 
 def parse_market_price(text: str) -> Optional[int]:
@@ -514,85 +514,81 @@ async def refresh_message(chat_id: int, msg_id: int, tries: int = 6, delay: floa
     return None
 
 
+def get_button(msg: Message, row: Optional[int] = None, col: Optional[int] = None,
+                text: Optional[str] = None):
+    """پیدا کردن آبجکت دکمه از msg.buttons — بر اساس (row, col) یا بر اساس متن. هرگز crash نمی‌کند."""
+    if not msg.buttons:
+        return None
+    if row is not None and col is not None:
+        try:
+            return msg.buttons[row][col]
+        except (IndexError, TypeError):
+            return None
+    if text is not None:
+        try:
+            for r in msg.buttons:
+                for b in r:
+                    if (getattr(b, "text", "") or "").strip() == text:
+                        return b
+        except Exception:
+            return None
+    return None
+
+
+async def raw_click(msg: Message, button) -> bool:
+    """
+    ارسال مستقیم Callback Query (Direct Callback Query Submission / Injecting Callback Data):
+    داده مخفی (data) خودِ دکمه مستقیماً استخراج و به تلگرام ارسال می‌شود — دقیقاً همان
+    درخواستی که خود تلگرام هنگام لمس دکمه می‌فرستد. چون این روش فقط به peer گروه نیاز
+    دارد (نه resolve دقیق کدام بات)، در گروه‌هایی که چند بات مختلف دارند و msg.click
+    معمولی خطا می‌دهد/کار نمی‌کند، پایدار باقی می‌ماند.
+    """
+    if button is None:
+        return False
+    try:
+        data = button.data
+    except AttributeError:
+        data = None
+    if not data:
+        return False
+    try:
+        chat = await msg.get_input_chat()
+        await client(GetBotCallbackAnswerRequest(peer=chat, msg_id=msg.id, data=data))
+        return True
+    except Exception as e:
+        log.warning(f"[BUTTON] کلیک مستقیم (callback data) ناموفق: {e}")
+        return False
+
+
 async def click_button(msg: Message, row: int, col: int, fallback_text: Optional[str] = None) -> bool:
     """
-    کلیک ایمن روی دکمه اینلاین طبق قانون کلی پروژه:
+    کلیک ایمن روی دکمه اینلاین با روش Callback Data مستقیم:
     ۱) همیشه اول تلاش با ایندکس (row, col)
     ۲) اگر ناموفق بود و fallback_text داده شده بود، تلاش با متن دکمه
     ۳) اگر هر دو ناموفق بودند، فقط لاگ می‌شود — هیچ خطایی اجرای ربات را متوقف نمی‌کند
     """
-    try:
-        await msg.click(row, col)
+    btn = get_button(msg, row=row, col=col)
+    if await raw_click(msg, btn):
         return True
-    except Exception as e_index:
-        if fallback_text:
-            try:
-                await msg.click(text=fallback_text)
-                return True
-            except Exception as e_text:
-                log.warning(
-                    f"[BUTTON] کلیک ایندکس ({row},{col}) و متن '{fallback_text}' هر دو ناموفق — "
-                    f"idx={e_index} | text={e_text}"
-                )
-                return False
-        log.warning(f"[BUTTON] کلیک ایندکس ({row},{col}) ناموفق (fallback متنی موجود نیست) — {e_index}")
+
+    if fallback_text:
+        btn = get_button(msg, text=fallback_text)
+        if await raw_click(msg, btn):
+            return True
+        log.warning(f"[BUTTON] کلیک ایندکس ({row},{col}) و متن '{fallback_text}' هر دو ناموفق.")
         return False
 
-
-async def click_by_text(msg: Message, text: str) -> bool:
-    """کلیک ایمن فقط با متن دکمه — برای مواردی که ایندکس دقیق مشخص نیست (مثل «انبار»)."""
-    try:
-        await msg.click(text=text)
-        return True
-    except Exception as e:
-        log.warning(f"[BUTTON] کلیک متنی '{text}' ناموفق — {e}")
-        return False
-    
-
-
-async def bypass_click(msg: Message, button_text: str) -> bool:
-    """
-    این تابع دکمه را بر اساس متن پیدا کرده و مستقیماً 
-    کال‌بک‌دیتای آن را به تلگرام تزریق می‌کند.
-    """
-    if not msg.buttons:
-        return False
-
-    for row in msg.buttons:
-        for btn in row:
-            if button_text in btn.text:
-                cb_data = getattr(btn.button, 'data', None)
-                
-                if cb_data:
-                    try:
-                        log.info(f"⚡ [BYPASS] شلیک مستقیم به دکمه: {btn.text}")
-                        await client(GetBotCallbackAnswerRequest(
-                            peer=msg.peer_id,
-                            msg_id=msg.id,
-                            data=cb_data,
-                            password=None
-                        ))
-                        log.info(f"✅ [SUCCESS] دکمه «{btn.text}» با موفقیت دور زده شد.")
-                        return True
-                    except Exception as e:
-                        log.error(f"❌ خطا در ارسال Bypass برای '{btn.text}': {e}")
-                        return False
-                else:
-                    log.warning(f"⚠️ دکمه '{btn.text}' دیتای مخفی ندارد، تلاش برای کلیک عادی...")
-                    await btn.click()
-                    return True
-    
-    log.warning(f"🔍 دکمه‌ای با متن '{button_text}' در این پیام یافت نشد.")
+    log.warning(f"[BUTTON] کلیک ایندکس ({row},{col}) ناموفق (fallback متنی موجود نیست).")
     return False
 
+
 async def click_by_text(msg: Message, text: str) -> bool:
-    """کلیک ایمن فقط با متن دکمه — برای مواردی که ایندکس دقیق مشخص نیست (مثل «انبار»)."""
-    try:
-        await msg.click(text=text)
+    """کلیک ایمن فقط با متن دکمه — با همان روش Callback Data مستقیم."""
+    btn = get_button(msg, text=text)
+    if await raw_click(msg, btn):
         return True
-    except Exception as e:
-        log.warning(f"[BUTTON] کلیک متنی '{text}' ناموفق — {e}")
-        return False
+    log.warning(f"[BUTTON] کلیک متنی '{text}' ناموفق.")
+    return False
 
 
 def _first_button_text(msg: Message) -> str:
@@ -921,7 +917,7 @@ async def pishi_loop() -> None:
                 if sv is not None:
                     set_stomach(sv)
                     log.info(f"[PISHI] شکم به‌روزرسانی شد: {sv}")
-                await bypass_click(msg, PISHI_BUTTON_TEXT)
+                await click_by_text(msg, PISHI_BUTTON_TEXT)
                 log.info("[PISHI] Button Clicked")
             else:
                 log.warning("[PISHI] دکمه پاسخ پیدا نشد.")
@@ -957,23 +953,16 @@ async def fishing_loop() -> None:
             set_last_run("fishing", time.time())
             log.info(f"[FISH] پیام ارسال شد → {target} (id={sent.id}) | منتظر پاسخ بات...")
 
-
             msg = await wait_for_reply(target, sent.id, {SELL_FISH_BUTTON, GIVE_TO_CAT_BUTTON})
             if msg:
                 stomach = get_stomach()
                 target_btn = GIVE_TO_CAT_BUTTON if stomach < threshold else SELL_FISH_BUTTON
                 log.info(f"[FISH] شکم={stomach} آستانه={threshold} → '{target_btn}'")
-                
-                # استفاده از بای‌پس کلیک به جای کلیک عادی
-                success = await bypass_click(msg, target_btn)
-                
-                if success:
-                    if target_btn == SELL_FISH_BUTTON:
-                        log.info("[FISH] ✅ ماهی با موفقیت فروخته شد (Bypass).")
-                    else:
-                        log.info("[FISH] ✅ ماهی با موفقیت به پیشی داده شد (Bypass).")
+                await click_by_text(msg, target_btn)
+                if target_btn == SELL_FISH_BUTTON:
+                    log.info("[FISH] Fish Sold")
                 else:
-                    log.warning(f"[FISH] ❌ کلیک مخفی روی '{target_btn}' ناموفق بود.")
+                    log.info("[FISH] Fish Given To Cat")
             else:
                 log.warning("[FISH] پیام پاسخ پیدا نشد.")
         except Exception as e:
@@ -1006,14 +995,13 @@ async def smuggling_cycle() -> str:
         log.warning("[SMUGGLE] پاسخی از بات دریافت نشد.")
         return "retry"
 
-    # تغییر ۱: استفاده از عدد ثابت ۵ به جای حداقل/حداکثر رندوم
-    target_count = 5 
+    smug_min = cfg_int("smuggling_min", 5)
+    smug_max = cfg_int("smuggling_max", 15)
+    target_count = random.randint(smug_min, max(smug_min, smug_max))
     last_wait: Optional[int] = None
 
     for _ in range(SMUGGLE_MAX_STEPS):
-        # حذف بک‌تیک‌ها از متن برای اینکه رگرس (re.search) دقیق کار کند
-        raw_text = msg.text or ""
-        text = raw_text.replace("`", "")
+        text = msg.text or ""
 
         # ۱) دستگیری
         if is_arrested(text):
@@ -1027,22 +1015,10 @@ async def smuggling_cycle() -> str:
             log.info("[SMUGGLE] کارمزد دریافت شد ✓")
             return "restart"
 
-        # تغییر ۲: اگر پیام قاچاق فعال آمد، زمان استخراج شده و در دیتابیس ست می‌شود
-        if "شما درحال قاچاق" in text or "تا اتمام قاچاق" in text:
-            dur = parse_duration(text)
-            if dur is None:
-                dur = 1800  # ۳۰ دقیقه پیش‌فرض در صورت عدم تشخیص دقیق زمان
-            
-            dur += 60
-            cfg_set("smuggling_wait_sec", str(dur))
-            set_last_run("smuggling", time.time())
-            log.info(f"[SMUGGLE] قاچاق از قبل فعال است. زمان انتظار تنظیم شد به: {fmt_time(dur)}")
-            return "started"
-
         # ۳) صفحه اول — نمایش پیشی‌های خیابونی + دکمه شروع
         cats = parse_street_cats(text)
-        if (cats is not None or ("قاچاق پیشی" in text and "تعداد پیشی های قاچاقی" not in text and "✨" not in text)) and msg.buttons:
-            log.info(f"[SMUGGLE] منوی اول قاچاق پیدا شد (پیشی‌ها: {cats}) — کلیک شروع قاچاق")
+        if cats is not None and msg.buttons:
+            log.info(f"[SMUGGLE] پیشی‌های خیابونی: {cats} — کلیک شروع قاچاق")
             await click_button(msg, 0, 0, fallback_text=SMUGGLE_START_TEXT)
             fresh = await refresh_message(group, msg.id)
             if fresh:
@@ -1057,11 +1033,9 @@ async def smuggling_cycle() -> str:
 
             dur = parse_duration(text)
             if dur is not None:
-                dur += 60
                 last_wait = dur
 
             if current < eff_target:
-                log.info(f"[SMUGGLE] تعداد فعلی ({current}) < هدف ({eff_target}) -> کلیک افزایش (0, 2)")
                 await click_button(msg, 0, 2, fallback_text=None)  # دکمه افزایش — بدون متن
                 fresh = await refresh_message(group, msg.id)
                 if fresh:
@@ -1069,7 +1043,6 @@ async def smuggling_cycle() -> str:
                 continue
 
             if current > eff_target:
-                log.info(f"[SMUGGLE] تعداد فعلی ({current}) > هدف ({eff_target}) -> کلیک کاهش (0, 0)")
                 await click_button(msg, 0, 0, fallback_text=None)  # دکمه کاهش — بدون متن
                 fresh = await refresh_message(group, msg.id)
                 if fresh:
@@ -1077,7 +1050,6 @@ async def smuggling_cycle() -> str:
                 continue
 
             # تعداد درست تنظیم شده → تایید نهایی و شروع واقعی قاچاق
-            log.info(f"[SMUGGLE] تعداد با هدف ({eff_target}) برابر شد. کلیک تایید نهایی (1, 0)")
             await click_button(msg, 1, 0, fallback_text=None)
             fresh = await refresh_message(group, msg.id)
             if fresh:
@@ -1089,7 +1061,6 @@ async def smuggling_cycle() -> str:
             if last_wait is None:
                 last_wait = cfg_int("smuggling_wait_sec", 1800)
 
-            last_wait += 60
             cfg_set("smuggling_wait_sec", str(last_wait))
             set_last_run("smuggling", time.time())
             log.info(f"[SMUGGLE] قاچاق شروع شد | تعداد={eff_target} | زمان={fmt_time(last_wait)}")
@@ -1101,6 +1072,7 @@ async def smuggling_cycle() -> str:
 
     log.warning("[SMUGGLE] سیکل بدون نتیجه قطعی پایان یافت.")
     return "retry"
+
 
 async def handle_prison(group: int) -> None:
     """مدیریت کامل حالت زندان میویی: ارسال، تایید ورود، پرداخت جریمه."""
@@ -1165,7 +1137,7 @@ async def smuggling_loop() -> None:
 
 async def factory_cycle() -> str:
     """
-    یک سیکل کامل کارخونه میویی (تولید + بررسی انبار/فروش).
+    یک سیکل تولید کارخونه میویی (فقط تولید — بررسی انبار/فروش کاملاً جدا و ساعتی است، در factory_price_watch_loop).
     خروجی: "started" | "in_progress" | "retry"
     """
     group = get_group("factory_group", DEFAULT_FACTORY_GROUP)
@@ -1184,7 +1156,9 @@ async def factory_cycle() -> str:
 
     try:
         if FACTORY_INPROGRESS_TEXT in btn0:
-            # در حال تولید — فقط زمان باقی‌مانده را می‌خوانیم
+            # در حال تولید — فقط زمان باقی‌مانده را می‌خوانیم و ذخیره می‌کنیم.
+            # نکته مهم: بعد از این، دیگر هیچ کلیک دیگری روی این پیام زده نمی‌شود
+            # تا تولید در حال انجام به‌اشتباه لغو نشود.
             await click_button(msg, 0, 0, fallback_text=FACTORY_INPROGRESS_TEXT)
             fresh = await refresh_message(group, msg.id)
             remaining = parse_duration((fresh.text if fresh else msg.text) or "")
@@ -1192,50 +1166,42 @@ async def factory_cycle() -> str:
 
             cfg_set("factory_wait_sec", str(wait_sec))
             set_last_run("factory", time.time())
-            log.info(f"[FACTORY] تولید در حال انجام است | باقی‌مانده={fmt_time(wait_sec)}")
-            status = "in_progress"
-        else:
-            # شروع یک تولید جدید (تولیدی هواپیما)
-            await click_button(msg, 0, 0, fallback_text=FACTORY_PRODUCE_TEXT)
-            fresh = await refresh_message(group, msg.id)
-            if fresh:
-                msg = fresh
+            log.info(f"[FACTORY] تولید در حال انجام است | باقی‌مانده={fmt_time(wait_sec)} | بدون کلیک اضافه")
+            return "in_progress"
 
-            await click_button(msg, 4, 0, fallback_text=FACTORY_AIRPLANE_TEXT)
-            fresh = await refresh_message(group, msg.id)
-            if fresh:
-                msg = fresh
+        # شروع یک تولید جدید (تولیدی هواپیما)
+        await click_button(msg, 0, 0, fallback_text=FACTORY_PRODUCE_TEXT)
+        fresh = await refresh_message(group, msg.id)
+        if fresh:
+            msg = fresh
 
-            await click_button(msg, 0, 2, fallback_text=None)
-            fresh = await refresh_message(group, msg.id)
-            if fresh:
-                msg = fresh
+        await click_button(msg, 4, 0, fallback_text=FACTORY_AIRPLANE_TEXT)
+        fresh = await refresh_message(group, msg.id)
+        if fresh:
+            msg = fresh
 
-            await click_button(msg, 0, 3, fallback_text=None)
-            fresh = await refresh_message(group, msg.id)
-            if fresh:
-                msg = fresh
+        await click_button(msg, 0, 2, fallback_text=None)
+        fresh = await refresh_message(group, msg.id)
+        if fresh:
+            msg = fresh
 
-            dur = parse_duration(msg.text or "")
-            wait_sec = dur if dur is not None else cfg_int("factory_wait_sec", 3600)
+        await click_button(msg, 0, 3, fallback_text=None)
+        fresh = await refresh_message(group, msg.id)
+        if fresh:
+            msg = fresh
 
-            await click_button(msg, 0, 0, fallback_text=FACTORY_START_TEXT)
+        dur = parse_duration(msg.text or "")
+        wait_sec = dur if dur is not None else cfg_int("factory_wait_sec", 3600)
 
-            cfg_set("factory_wait_sec", str(wait_sec))
-            set_last_run("factory", time.time())
-            log.info(f"[FACTORY] تولید هواپیما شروع شد | زمان={fmt_time(wait_sec)}")
-            status = "started"
+        await click_button(msg, 0, 0, fallback_text=FACTORY_START_TEXT)
+
+        cfg_set("factory_wait_sec", str(wait_sec))
+        set_last_run("factory", time.time())
+        log.info(f"[FACTORY] تولید هواپیما شروع شد | زمان={fmt_time(wait_sec)}")
+        return "started"
     except Exception as e:
         log.error(f"[FACTORY] خطا در بخش تولید: {e}")
         return "retry"
-
-    # بخش انبار / فروش — مستقل از نتیجه تولید، هرگز جلوی برنامه را نمی‌گیرد
-    try:
-        await factory_warehouse_check(group)
-    except Exception as e:
-        log.error(f"[FACTORY] خطا در بررسی انبار: {e}")
-
-    return status
 
 
 async def factory_warehouse_check(group: int) -> None:
@@ -1282,6 +1248,39 @@ async def factory_warehouse_check(group: int) -> None:
         log.info(f"[FACTORY] قیمت بازار={price} < آستانه={threshold} → فروشی انجام نشد")
 
 
+def seconds_until_next_31() -> float:
+    """
+    ثانیه‌های باقی‌مانده تا دقیقه ۳۱ ساعت جاری (یا ساعت بعد اگر رد شده باشیم) —
+    چون قیمت بازار هر ساعت، سرِ دقیقه ۳۱ به‌روزرسانی می‌شود.
+    """
+    now_ts = time.time()
+    now = time.localtime(now_ts)
+    this_hour_31 = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, 31, 0, 0, 0, -1))
+    if this_hour_31 > now_ts:
+        return this_hour_31 - now_ts
+    return (this_hour_31 + 3600) - now_ts
+
+
+async def factory_price_watch_loop() -> None:
+    """
+    حلقه‌ای کاملاً مستقل از چرخه تولید: دقیقاً سرِ دقیقه ۳۱ هر ساعت (۱:۳۱، ۲:۳۱، ۳:۳۱، ...)
+    قیمت بازار انبار را چک می‌کند. اگر به آستانه نرسیده باشد، هیچ کلیکی (حتی برای فروش) زده نمی‌شود.
+    """
+    while True:
+        wait = seconds_until_next_31()
+        log.info(f"[FACTORY-PRICE] {fmt_time(wait)} تا بررسی بعدی قیمت بازار (ساعت:۳۱)")
+        await asyncio.sleep(wait)
+
+        if not cfg_bool("factory_enabled"):
+            continue
+
+        try:
+            group = get_group("factory_group", DEFAULT_FACTORY_GROUP)
+            await factory_warehouse_check(group)
+        except Exception as e:
+            log.error(f"[FACTORY-PRICE] خطا: {e}")
+
+
 async def factory_loop() -> None:
     if get_last_run("factory") == 0.0:
         wait = FACTORY_INITIAL_DELAY
@@ -1316,64 +1315,41 @@ async def factory_loop() -> None:
 #  Rescue Listener
 # ══════════════════════════════════════════════════
 
+async def sniper_click(msg: Message, action_type: str):
+    raw_text = msg.text or ""
+
+    # بررسی متن برای اطمینان از حضور پیشی خیابونی و اینکه قبلاً توسط کسی گرفته نشده باشه
+    if ("یک پیشی خیابونی توی شهر پیدا شد" in raw_text or "لطفا به پیشی" in raw_text) and "نجات داد" not in raw_text:
+        if msg.buttons:
+            for r_idx, row in enumerate(msg.buttons):
+                for c_idx, btn in enumerate(row):
+                    if "نجات پیشی" in btn.text:
+                        log.info(f"🎯 [پیشی شکار شد! ({action_type})] ──> ارسال فوری کلیک...")
+
+                        # ارسال ۲ کلیک رگباری بسیار سریع بدون بلاک شدن توسط تلگرام
+                        for _ in range(3):
+                            client.loop.create_task(btn.click())
+                        return True
+    return False
+
+
 async def rescue_listener() -> None:
     rescue_groups = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
+    bot_list = list(TARGET_BOTS)
 
-    @client.on(events.NewMessage(chats=rescue_groups))
-    async def handler(event):
+    @client.on(events.NewMessage(chats=rescue_groups, from_users=bot_list))
+    async def handle_new_msg(event):
         if not cfg_bool("rescue_enabled"):
             return
+        await sniper_click(event.message, "پیام جدید")
 
-        msg = event.message
-        if not msg.buttons:
+    @client.on(events.MessageEdited(chats=rescue_groups, from_users=bot_list))
+    async def handle_edited_msg(event):
+        if not cfg_bool("rescue_enabled"):
             return
-        btn_texts = {b.text.strip() for row in msg.buttons for b in row}
-        if RESCUE_BUTTON_TEXT not in btn_texts:
-            return
-        sender = await msg.get_sender()
-        if not is_bot(msg, sender):
-            return
-
-        chat_id = event.chat_id
-        log.info(f"[RESCUE] پیشی خیابونی پیدا شد در گروه {chat_id} — کلیک فوری...")
-
-        asyncio.create_task(_safe_click(msg, RESCUE_BUTTON_TEXT))
-
-        for attempt in range(5):
-            try:
-                await msg.click(text=RESCUE_BUTTON_TEXT)
-                log.info(f"[RESCUE] Street Cat Rescued (تلاش {attempt + 1})")
-                break
-            except Exception:
-                pass
-            await asyncio.sleep(0.01)
-
-        await asyncio.sleep(0.1)
-
-        for _ in range(8):
-            try:
-                fresh = await client.get_messages(chat_id, ids=msg.id)
-                if not fresh or not fresh.buttons:
-                    log.info("[RESCUE] دکمه رفت — عملیات کامل شد ✓")
-                    break
-                cur = {b.text.strip() for row in fresh.buttons for b in row}
-                if RESCUE_BUTTON_TEXT not in cur:
-                    log.info("[RESCUE] دکمه رفت — عملیات کامل شد ✓")
-                    break
-                await fresh.click(text=RESCUE_BUTTON_TEXT)
-                log.info("[RESCUE] کلیک مجدد انجام شد")
-                await asyncio.sleep(0.1)
-            except Exception:
-                break
+        await sniper_click(event.message, "پیام ادیت‌شده/فرصت مجدد")
 
     await client.run_until_disconnected()
-
-
-async def _safe_click(msg: Message, text: str) -> None:
-    try:
-        await msg.click(text=text)
-    except Exception:
-        pass
 
 
 # ══════════════════════════════════════════════════
@@ -1405,14 +1381,18 @@ async def main() -> None:
     me = await client.get_me()
 
     log.info(f"[SYSTEM] اکانت متصل شد: {me.first_name} (@{me.username})")
+    log.info(f"[SYSTEM] بات‌های هدف (آینه): {', '.join(sorted(TARGET_BOTS))}")
     log.info(f"[SYSTEM] گروه میو: {get_group('group_meow', DEFAULT_MEOW_GROUP)}")
     log.info(f"[SYSTEM] گروه پیشی: {get_group('group_pishi', DEFAULT_PISHI_GROUP)}")
     log.info(f"[SYSTEM] گروه ماهیگیری: {get_group('group_fish', DEFAULT_FISH_GROUP)}")
     log.info(f"[SYSTEM] گروه‌های خیابونی: {get_group_list('group_rescue', DEFAULT_RESCUE_GROUPS)}")
+    log.info(f"[SYSTEM] گروه قاچاق: {get_group('smuggling_group', DEFAULT_SMUGGLING_GROUP)}")
+    log.info(f"[SYSTEM] گروه کارخونه: {get_group('factory_group', DEFAULT_FACTORY_GROUP)}")
     log.info(f"[SYSTEM] شکم فعلی: {get_stomach()}")
     log.info(f"[SYSTEM] سلف={onoff(cfg_bool('self_enabled'))} میو={onoff(cfg_bool('meow_enabled'))} "
              f"پیشی={onoff(cfg_bool('pishi_enabled'))} ماهیگیری={onoff(cfg_bool('fishing_enabled'))} "
-             f"خیابونی={onoff(cfg_bool('rescue_enabled'))}")
+             f"خیابونی={onoff(cfg_bool('rescue_enabled'))} قاچاق={onoff(cfg_bool('smuggling_enabled'))} "
+             f"کارخونه={onoff(cfg_bool('factory_enabled'))}")
     log.info(f"[SYSTEM] ربات فعال شد — برای منو در تلگرام {MENU_TRIGGER} را ارسال کنید.\n")
 
     await asyncio.gather(
@@ -1420,9 +1400,10 @@ async def main() -> None:
         pishi_loop(),
         fishing_loop(),
         rescue_listener(),
-        command_listener(),
         smuggling_loop(),
         factory_loop(),
+        factory_price_watch_loop(),
+        command_listener(),
     )
 
 
