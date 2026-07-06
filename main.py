@@ -44,7 +44,7 @@ API_HASH = "09c24af20084de9372cc92a760c74961"
 SESSION_NAME = "my_account_session"
 DB_FILE      = "data/timers.db"
 
-TARGET_BOT = "@MeowieQBot"
+TARGET_BOT = "@MeowieeeQBot"
 
 RESCUE_BUTTON_TEXT = "نجات پیشی خیابونی 🐱"
 PISHI_BUTTON_TEXT  = "برداشت میو پوینت ها"
