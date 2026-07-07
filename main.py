@@ -116,80 +116,6 @@ DEFAULT_TOGGLES = {
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# ══════════════════════════════════════════════════
-#  سیستم بیدارباش فوری (Wake Events)
-#  وقتی کاربر با دستور فارسی مقداری (فاصله زمانی/گروه) را تغییر می‌دهد،
-#  حلقه‌ی مربوطه که ممکن است در وسط asyncio.sleep طولانی گیر کرده باشد
-#  باید فوراً بیدار شود و دوباره از دیتابیس بخواند — بدون نیاز به ری‌استارت ربات.
-# ══════════════════════════════════════════════════
-WAKE_EVENTS: dict = {}
-
-
-def get_wake_event(name: str) -> asyncio.Event:
-    """گرفتن (یا ساخت) Event مربوط به یک حلقه، بر اساس نام."""
-    ev = WAKE_EVENTS.get(name)
-    if ev is None:
-        ev = asyncio.Event()
-        WAKE_EVENTS[name] = ev
-    return ev
-
-
-def wake_loop(name: str) -> None:
-    """بیدار کردن فوری یک حلقه‌ی مشخص (مثلاً بعد از تغییر تنظیمات آن)."""
-    get_wake_event(name).set()
-
-
-def wake_loops(*names: str) -> None:
-    for n in names:
-        wake_loop(n)
-
-
-async def sleep_or_wake(seconds: float, wake_name: str) -> None:
-    """
-    مثل asyncio.sleep ولی اگر در حین انتظار سیگنال «بیدارباش» برای wake_name
-    ست شود، فوراً (بدون صبر تا پایان seconds) برمی‌گردد تا حلقه دوباره
-    تنظیمات/گروه جدید را از دیتابیس بخواند.
-    """
-    if seconds <= 0:
-        return
-    ev = get_wake_event(wake_name)
-    ev.clear()
-    try:
-        await asyncio.wait_for(ev.wait(), timeout=seconds)
-    except asyncio.TimeoutError:
-        pass
-    finally:
-        ev.clear()
-
-
-# نگاشت: کلید دیتابیسی که با دستور فارسی تغییر می‌کند → نام(های) حلقه‌ای که باید بیدار شود
-CONFIG_TO_LOOP = {
-    "meow_sec":          ["meow"],
-    "meow_list":         ["meow"],
-    "pishi_sec":         ["pishi"],
-    "fish_sec":          ["fishing"],
-    "stomach":           ["fishing", "pishi"],
-    "group_meow":        ["meow"],
-    "group_pishi":       ["pishi"],
-    "group_fish":        ["fishing"],
-    "group_rescue":      ["rescue"],
-    "smuggling_min":     ["smuggling"],
-    "smuggling_max":     ["smuggling"],
-    "min_sell_price":    ["factory_price"],
-    "smuggling_group":   ["smuggling"],
-    "factory_group":     ["factory", "factory_price"],
-}
-
-# نگاشت: کلید دستور روشن/خاموش فارسی → نام(های) حلقه‌ای که باید بیدار شود
-TOGGLE_TO_LOOP = {
-    "میو":       ["meow"],
-    "پیشی":      ["pishi"],
-    "ماهیگیری":  ["fishing"],
-    "خیابونی":   ["rescue"],
-    "قاچاق":     ["smuggling"],
-    "کارخونه":   ["factory", "factory_price"],
-}
-
 
 # ══════════════════════════════════════════════════
 #  لایه دیتابیس
@@ -415,50 +341,6 @@ def fmt_time(s: float) -> str:
 
 def onoff(flag: bool) -> str:
     return "🟢 روشن" if flag else "🔴 خاموش"
-
-
-# ══════════════════════════════════════════════════
-#  کش نام گروه‌ها (برای نمایش در وضعیت به‌جای فقط آیدی خام)
-# ══════════════════════════════════════════════════
-_GROUP_NAME_CACHE: dict = {}          # {group_id: (name, fetched_at)}
-GROUP_NAME_CACHE_TTL = 300            # ثانیه — کش برای ۵ دقیقه معتبر است
-
-
-async def get_group_name(gid: int) -> str:
-    """
-    نام (تایتل) گروه/کانال با آیدی gid را برمی‌گرداند.
-    نتیجه به مدت GROUP_NAME_CACHE_TTL کش می‌شود تا هر بار درخواست‌های
-    غیرضروری به تلگرام زده نشود. در صورت خطا، خودِ آیدی به‌عنوان نام برگردانده می‌شود.
-    """
-    now = time.time()
-    cached = _GROUP_NAME_CACHE.get(gid)
-    if cached and (now - cached[1] < GROUP_NAME_CACHE_TTL):
-        return cached[0]
-    try:
-        entity = await client.get_entity(gid)
-        name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(gid)
-    except Exception as e:
-        log.warning(f"[SYSTEM] گرفتن نام گروه {gid} ناموفق: {e}")
-        name = str(gid)
-    _GROUP_NAME_CACHE[gid] = (name, now)
-    return name
-
-
-async def fmt_group(gid: int) -> str:
-    """قالب نمایشی «نام (آیدی)» برای یک گروه."""
-    name = await get_group_name(gid)
-    return f"{name} ({gid})"
-
-
-async def fmt_group_list(gids: list) -> str:
-    """قالب نمایشی چندخطی «نام (آیدی)» برای لیستی از گروه‌ها."""
-    if not gids:
-        return "— هیچ گروهی تنظیم نشده —"
-    lines = []
-    for gid in gids:
-        name = await get_group_name(gid)
-        lines.append(f"  • {name} ({gid})")
-    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════
@@ -788,7 +670,7 @@ def build_menu() -> str:
     )
 
 
-async def build_status() -> str:
+def build_status() -> str:
     mi = cfg_int("meow_sec")
     pi = cfg_int("pishi_sec")
     fi = cfg_int("fish_sec")
@@ -801,16 +683,6 @@ async def build_status() -> str:
     g_rescue = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
     g_smuggle = get_group("smuggling_group", DEFAULT_SMUGGLING_GROUP)
     g_factory = get_group("factory_group", DEFAULT_FACTORY_GROUP)
-
-    # نام گروه‌ها را موازی از تلگرام می‌گیریم تا سریع‌تر باشد
-    name_meow, name_pishi, name_fish, name_smuggle, name_factory = await asyncio.gather(
-        fmt_group(g_meow),
-        fmt_group(g_pishi),
-        fmt_group(g_fish),
-        fmt_group(g_smuggle),
-        fmt_group(g_factory),
-    )
-    rescue_list_str = await fmt_group_list(g_rescue)
 
     smuggling_wait = cfg_int("smuggling_wait_sec", 1800)
     factory_wait   = cfg_int("factory_wait_sec", 3600)
@@ -828,12 +700,12 @@ async def build_status() -> str:
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🍖 شکم فعلی: {stomach}\n"
         f"🎯 آستانه شکم: {threshold}\n\n"
-        f"🐱 گروه میو: {name_meow}\n"
-        f"🐾 گروه پیشی: {name_pishi}\n"
-        f"🎣 گروه ماهیگیری: {name_fish}\n"
-        f"🏘 گروه‌های خیابونی ({len(g_rescue)} گروه):\n{rescue_list_str}\n"
-        f"📦 گروه قاچاق: {name_smuggle}\n"
-        f"🏭 گروه کارخونه: {name_factory}\n\n"
+        f"🐱 گروه میو: {g_meow}\n"
+        f"🐾 گروه پیشی: {g_pishi}\n"
+        f"🎣 گروه ماهیگیری: {g_fish}\n"
+        f"🏘 تعداد گروه‌های خیابونی: {len(g_rescue)}\n"
+        f"📦 گروه قاچاق: {g_smuggle}\n"
+        f"🏭 گروه کارخونه: {g_factory}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🔢 حداقل قاچاق: {cfg_int('smuggling_min')}\n"
         f"🔢 حداکثر قاچاق: {cfg_int('smuggling_max')}\n"
@@ -917,7 +789,7 @@ async def handle_command(event) -> None:
 
     try:
         if cmd == "وضعیت":
-            await event.edit(await build_status()); return
+            await event.edit(build_status()); return
         if cmd == "تایمر":
             await event.edit(build_timers()); return
 
@@ -926,9 +798,6 @@ async def handle_command(event) -> None:
             db_key = TOGGLE_COMMANDS[cmd]
             new_val = rest == "روشن"
             cfg_bool_set(db_key, new_val)
-            # بیدار کردن فوری حلقه‌ی مربوطه تا بدون ری‌استارت اعمال شود
-            loop_names = TOGGLE_TO_LOOP.get(cmd, [])
-            wake_loops(*loop_names)
             await event.edit(f"✅ {cmd} {onoff(new_val)} شد.")
             return
 
@@ -965,9 +834,6 @@ async def handle_command(event) -> None:
                     return
                 cfg_set(db_key, ",".join(ids))
 
-            # بیدار کردن فوری همه‌ی حلقه‌های وابسته به این تنظیم — بدون نیاز به ری‌استارت
-            wake_loops(*CONFIG_TO_LOOP.get(db_key, []))
-
             await event.edit(f"✅ {label} به «{rest}» تغییر یافت و ذخیره شد.")
             return
 
@@ -993,26 +859,18 @@ async def meow_loop() -> None:
     wait = secs_left("meow", interval)
     if wait > 0:
         log.info(f"[MEOW] {fmt_time(wait)} تا اجرای بعدی مانده")
-        await sleep_or_wake(wait, "meow")
+        await asyncio.sleep(wait)
 
     while True:
         if not cfg_bool("meow_enabled"):
-            await sleep_or_wake(5, "meow")
+            await asyncio.sleep(5)
             continue
 
         interval = cfg_int("meow_sec", 245)
-
-        # اگر هنوز به موعد ارسال نرسیده (مثلاً فاصله زمانی تازه تغییر کرده)، صبر می‌کنیم
-        # ولی این صبر با wake_loop("meow") قابل قطع فوری است.
-        wait = secs_left("meow", interval)
-        if wait > 0:
-            await sleep_or_wake(wait, "meow")
-            continue
-
         choices = [x.strip() for x in cfg("meow_list", DEFAULT_CONFIG["meow_list"]).split(",") if x.strip()]
         if not choices:
             log.error("[MEOW] لیست میو خالی است — رد شد")
-            await sleep_or_wake(interval, "meow")
+            await asyncio.sleep(interval)
             continue
 
         text = random.choice(choices)
@@ -1025,8 +883,7 @@ async def meow_loop() -> None:
         else:
             log.warning(f"[MEOW] ارسال ناموفق به گروه {target}")
 
-        interval = cfg_int("meow_sec", 245)
-        await sleep_or_wake(interval, "meow")
+        await asyncio.sleep(interval)
 
 
 async def pishi_loop() -> None:
@@ -1034,26 +891,21 @@ async def pishi_loop() -> None:
     wait = secs_left("pishi", interval)
     if wait > 0:
         log.info(f"[PISHI] {fmt_time(wait)} تا اجرای بعدی مانده")
-        await sleep_or_wake(wait, "pishi")
+        await asyncio.sleep(wait)
 
     while True:
         if not cfg_bool("pishi_enabled"):
-            await sleep_or_wake(5, "pishi")
+            await asyncio.sleep(5)
             continue
 
         interval = cfg_int("pishi_sec", 1480)
-        wait = secs_left("pishi", interval)
-        if wait > 0:
-            await sleep_or_wake(wait, "pishi")
-            continue
-
         target = get_group("group_pishi", DEFAULT_PISHI_GROUP)
 
         try:
             sent = await safe_send(target, PISHI_MSG_TEXT)
             if not sent:
                 log.warning(f"[PISHI] ارسال ناموفق به گروه {target}")
-                await sleep_or_wake(interval, "pishi")
+                await asyncio.sleep(interval)
                 continue
 
             set_last_run("pishi", time.time())
@@ -1072,8 +924,7 @@ async def pishi_loop() -> None:
         except Exception as e:
             log.error(f"[PISHI] خطا: {e}")
 
-        interval = cfg_int("pishi_sec", 1480)
-        await sleep_or_wake(interval, "pishi")
+        await asyncio.sleep(interval)
 
 
 async def fishing_loop() -> None:
@@ -1081,19 +932,14 @@ async def fishing_loop() -> None:
     wait = secs_left("fishing", interval)
     if wait > 0:
         log.info(f"[FISH] {fmt_time(wait)} تا اجرای بعدی مانده")
-        await sleep_or_wake(wait, "fishing")
+        await asyncio.sleep(wait)
 
     while True:
         if not cfg_bool("fishing_enabled"):
-            await sleep_or_wake(5, "fishing")
+            await asyncio.sleep(5)
             continue
 
         interval = cfg_int("fish_sec", 1500)
-        wait = secs_left("fishing", interval)
-        if wait > 0:
-            await sleep_or_wake(wait, "fishing")
-            continue
-
         threshold = cfg_int("stomach", 7)
         target = get_group("group_fish", DEFAULT_FISH_GROUP)
 
@@ -1101,7 +947,7 @@ async def fishing_loop() -> None:
             sent = await safe_send(target, FISH_MSG_TEXT)
             if not sent:
                 log.warning(f"[FISH] ارسال ناموفق به گروه {target}")
-                await sleep_or_wake(interval, "fishing")
+                await asyncio.sleep(interval)
                 continue
 
             set_last_run("fishing", time.time())
@@ -1122,8 +968,7 @@ async def fishing_loop() -> None:
         except Exception as e:
             log.error(f"[FISH] خطا: {e}")
 
-        interval = cfg_int("fish_sec", 1500)
-        await sleep_or_wake(interval, "fishing")
+        await asyncio.sleep(interval)
 
 
 # ══════════════════════════════════════════════════
@@ -1264,16 +1109,11 @@ async def smuggling_loop() -> None:
     wait = secs_left("smuggling", cfg_int("smuggling_wait_sec", 1800))
     if wait > 0:
         log.info(f"[SMUGGLE] {fmt_time(wait)} تا اجرای بعدی مانده")
-        await sleep_or_wake(wait, "smuggling")
+        await asyncio.sleep(wait)
 
     while True:
         if not cfg_bool("smuggling_enabled"):
-            await sleep_or_wake(5, "smuggling")
-            continue
-
-        wait = secs_left("smuggling", cfg_int("smuggling_wait_sec", 1800))
-        if wait > 0:
-            await sleep_or_wake(wait, "smuggling")
+            await asyncio.sleep(5)
             continue
 
         try:
@@ -1284,11 +1124,11 @@ async def smuggling_loop() -> None:
 
         if status == "started":
             wait = secs_left("smuggling", cfg_int("smuggling_wait_sec", 1800))
-            await sleep_or_wake(wait if wait > 0 else SMUGGLE_RETRY_DELAY, "smuggling")
+            await asyncio.sleep(wait if wait > 0 else SMUGGLE_RETRY_DELAY)
         elif status == "restart":
-            await sleep_or_wake(SMUGGLE_RESTART_DELAY, "smuggling")
+            await asyncio.sleep(SMUGGLE_RESTART_DELAY)
         else:
-            await sleep_or_wake(SMUGGLE_RETRY_DELAY, "smuggling")
+            await asyncio.sleep(SMUGGLE_RETRY_DELAY)
 
 
 # ══════════════════════════════════════════════════
@@ -1429,12 +1269,7 @@ async def factory_price_watch_loop() -> None:
     while True:
         wait = seconds_until_next_31()
         log.info(f"[FACTORY-PRICE] {fmt_time(wait)} تا بررسی بعدی قیمت بازار (ساعت:۳۱)")
-        await sleep_or_wake(wait, "factory_price")
-
-        # اگر sleep_or_wake به‌خاطر یک بیدارباش (مثلاً تغییر گروه کارخونه) زودتر
-        # از موعد ۳۱ دقیقه برگشته باشد، هنوز وقتش نرسیده — دوباره صبر می‌کنیم.
-        if seconds_until_next_31() > 5:
-            continue
+        await asyncio.sleep(wait)
 
         if not cfg_bool("factory_enabled"):
             continue
@@ -1456,16 +1291,11 @@ async def factory_loop() -> None:
             log.info(f"[FACTORY] {fmt_time(wait)} تا اجرای بعدی مانده")
 
     if wait > 0:
-        await sleep_or_wake(wait, "factory")
+        await asyncio.sleep(wait)
 
     while True:
         if not cfg_bool("factory_enabled"):
-            await sleep_or_wake(5, "factory")
-            continue
-
-        wait = secs_left("factory", cfg_int("factory_wait_sec", 3600))
-        if wait > 0:
-            await sleep_or_wake(wait, "factory")
+            await asyncio.sleep(5)
             continue
 
         try:
@@ -1476,25 +1306,14 @@ async def factory_loop() -> None:
 
         if status in ("started", "in_progress"):
             wait = secs_left("factory", cfg_int("factory_wait_sec", 3600))
-            await sleep_or_wake(wait if wait > 0 else FACTORY_RETRY_DELAY, "factory")
+            await asyncio.sleep(wait if wait > 0 else FACTORY_RETRY_DELAY)
         else:
-            await sleep_or_wake(FACTORY_RETRY_DELAY, "factory")
+            await asyncio.sleep(FACTORY_RETRY_DELAY)
 
 
 # ══════════════════════════════════════════════════
 #  Rescue Listener
 # ══════════════════════════════════════════════════
-
-RESCUE_CLICK_ATTEMPTS = 5  # تعداد کلیک‌های رگباری برای افزایش شانس نجات پیشی خیابونی
-
-
-async def _fire_click(btn, attempt: int) -> None:
-    """یک تلاش برای کلیک روی دکمه؛ خطاها فقط لاگ می‌شوند و مانع تلاش‌های دیگر نمی‌شوند."""
-    try:
-        await btn.click()
-    except Exception as e:
-        log.warning(f"[RESCUE] کلیک شماره {attempt} ناموفق: {e}")
-
 
 async def sniper_click(msg: Message, action_type: str):
     raw_text = msg.text or ""
@@ -1505,45 +1324,28 @@ async def sniper_click(msg: Message, action_type: str):
             for r_idx, row in enumerate(msg.buttons):
                 for c_idx, btn in enumerate(row):
                     if "نجات پیشی" in btn.text:
-                        log.info(f"🎯 [پیشی شکار شد! ({action_type})] ──> ارسال فوری {RESCUE_CLICK_ATTEMPTS} کلیک...")
+                        log.info(f"🎯 [پیشی شکار شد! ({action_type})] ──> ارسال فوری کلیک...")
 
-                        # همه‌ی کلیک‌ها واقعاً و به‌صورت تضمین‌شده (نه فقط schedule) اجرا می‌شوند:
-                        # asyncio.gather با return_exceptions=True یعنی حتی اگر یکی fail شود،
-                        # بقیه هم اجرا می‌شوند و هیچ‌کدام گم/کنسل نمی‌شوند.
-                        await asyncio.gather(
-                            *[_fire_click(btn, i + 1) for i in range(RESCUE_CLICK_ATTEMPTS)],
-                            return_exceptions=True,
-                        )
+                        # ارسال ۲ کلیک رگباری بسیار سریع بدون بلاک شدن توسط تلگرام
+                        for _ in range(2):
+                            client.loop.create_task(btn.click())
                         return True
     return False
 
 
 async def rescue_listener() -> None:
-    """
-    به‌جای ثبت هندلر با لیست ثابت گروه‌ها (که فقط در startup خوانده می‌شد و با
-    تغییر بعدی .گروه_خیابونی دیگر به‌روز نمی‌شد)، هندلر روی همه‌ی چت‌ها (chats=None)
-    ثبت می‌شود و در هر پیام، لیست گروه‌های خیابونی *لحظه‌ای* از دیتابیس خوانده
-    می‌شود. این‌طوری تغییر گروه‌ها فوراً و بدون ری‌استارت اعمال می‌شود.
-    """
+    rescue_groups = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
     bot_list = list(TARGET_BOTS)
 
-    def _in_rescue_groups(chat_id: int) -> bool:
-        current_groups = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
-        return chat_id in current_groups
-
-    @client.on(events.NewMessage(from_users=bot_list))
+    @client.on(events.NewMessage(chats=rescue_groups, from_users=bot_list))
     async def handle_new_msg(event):
         if not cfg_bool("rescue_enabled"):
             return
-        if not _in_rescue_groups(event.chat_id):
-            return
         await sniper_click(event.message, "پیام جدید")
 
-    @client.on(events.MessageEdited(from_users=bot_list))
+    @client.on(events.MessageEdited(chats=rescue_groups, from_users=bot_list))
     async def handle_edited_msg(event):
         if not cfg_bool("rescue_enabled"):
-            return
-        if not _in_rescue_groups(event.chat_id):
             return
         await sniper_click(event.message, "پیام ادیت‌شده/فرصت مجدد")
 
