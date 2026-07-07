@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Afshin Self — ربات سلف تلگرام (Telethon)
-بازطراحی کامل: دیتابیس، منوی فارسی با نقطه، کنترل روشن/خاموش ماژول‌ها، لاگ حرفه‌ای.
+بازطراحی کامل ماژول کارخونه، وضعیت، تنظیمات و بروزرسانی لحظه‌ای گروه‌ها.
 """
 
 import asyncio
@@ -11,7 +11,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Optional, Iterator, Tuple
+from typing import Optional, Iterator, Tuple, List
 
 from telethon import TelegramClient, events
 from telethon.tl.custom.message import Message
@@ -51,7 +51,6 @@ PISHI_BUTTON_TEXT  = "برداشت میو پوینت ها"
 SELL_FISH_BUTTON   = "فروش ماهی"
 GIVE_TO_CAT_BUTTON = "بده پیشی بخوره"
 
-# متن‌های ثابت پیام‌ها (دیگر در دیتابیس ذخیره نمی‌شوند)
 PISHI_MSG_TEXT = "پیشی"
 FISH_MSG_TEXT  = "ماهی"
 
@@ -83,11 +82,11 @@ WAREHOUSE_TEXT          = "انبار"
 SELL_PRODUCT_TEXT       = "فروش محصول"
 
 # سقف‌ها و تاخیرهای ایمنی قاچاق/کارخونه
-SMUGGLE_MAX_STEPS     = 40   # سقف تلاش داخلی هر سیکل — جلوگیری از حلقه بی‌نهایت
-SMUGGLE_RETRY_DELAY   = 30   # ثانیه — تاخیر تلاش مجدد در صورت خطا/وضعیت ناشناخته
-SMUGGLE_RESTART_DELAY = 5    # ثانیه — تاخیر کوتاه قبل از شروع مجدد بعد از زندان/دریافت کارمزد
-FACTORY_RETRY_DELAY   = 60   # ثانیه — تاخیر تلاش مجدد کارخونه در صورت خطا
-FACTORY_INITIAL_DELAY = 300  # ۵ دقیقه — فقط در اولین اجرای کاملاً تازه (بدون سابقه در دیتابیس)
+SMUGGLE_MAX_STEPS     = 40
+SMUGGLE_RETRY_DELAY   = 30
+SMUGGLE_RESTART_DELAY = 5
+FACTORY_RETRY_DELAY   = 60
+FACTORY_INITIAL_DELAY = 300
 
 # مقادیر پیش‌فرض تنظیمات عددی/متنی
 DEFAULT_CONFIG = {
@@ -115,6 +114,13 @@ DEFAULT_TOGGLES = {
 }
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+# رویداد داخلی برای اطلاع‌رسانی به rescue_listener که لیست گروه‌های خیابونی تغییر کرده
+rescue_groups_changed = asyncio.Event()
+
+# کش نام گروه‌ها — جلوگیری از فراخوانی مکرر get_entity برای هر رندر وضعیت
+_entity_name_cache: dict = {}
+_entity_cache_ttl = 300  # ثانیه
 
 
 # ══════════════════════════════════════════════════
@@ -166,19 +172,12 @@ def init_db() -> None:
             )
             c.execute("INSERT OR IGNORE INTO cat_stats (id, stomach) VALUES (1, 0)")
 
-            # تنظیمات عددی/متنی پیش‌فرض
             for k, v in DEFAULT_CONFIG.items():
-                c.execute(
-                    "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v)
-                )
+                c.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
 
-            # روشن/خاموش ماژول‌ها
             for k, v in DEFAULT_TOGGLES.items():
-                c.execute(
-                    "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v)
-                )
+                c.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
 
-            # گروه‌ها
             c.execute(
                 "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
                 ("group_meow", str(DEFAULT_MEOW_GROUP)),
@@ -204,7 +203,6 @@ def init_db() -> None:
                 ("factory_group", str(DEFAULT_FACTORY_GROUP)),
             )
 
-            # پاک‌سازی کلیدهای منسوخ (pishi_msg / fish_msg) طبق درخواست حذف کامل
             c.execute("DELETE FROM config WHERE key IN ('pishi_msg', 'fish_msg')")
 
         log.info("[DB] Connected")
@@ -217,7 +215,11 @@ def init_db() -> None:
 
 
 def cfg(key: str, default: str = "") -> str:
-    """خواندن یک مقدار از جدول config. در صورت خطا یا نبود، مقدار پیش‌فرض برمی‌گردد."""
+    """
+    خواندن مستقیم از دیتابیس در هر بار فراخوانی — به‌عمد بدون کش.
+    این تضمین می‌کند که تغییر یک تنظیم از طریق پنل، در همان لحظه توسط تمام
+    حلقه‌ها (که هر بار دوباره cfg() را صدا می‌زنند) دیده شود؛ نیازی به ریستارت نیست.
+    """
     try:
         with db_cursor() as c:
             c.execute("SELECT value FROM config WHERE key=?", (key,))
@@ -236,7 +238,7 @@ def cfg_set(key: str, value: str) -> None:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
-        log.info(f"[CFG] {key} => {value}")
+        log.info(f"[CFG] تنظیم بروزرسانی شد: {key} => {value}")
     except sqlite3.Error as e:
         log.error(f"[DB] خطا در ذخیره '{key}': {e}")
 
@@ -304,6 +306,12 @@ def set_last_run(key: str, ts: float) -> None:
         log.error(f"[DB] خطا در ذخیره تایمر '{key}': {e}")
 
 
+def reset_timer(key: str) -> None:
+    """صفر کردن کامل یک تایمر — استفاده در دستورهایی مثل .تایم_کارخونه که باید فوراً اعمال شوند."""
+    set_last_run(key, time.time())
+    log.info(f"[TIMER] تایمر '{key}' ریست شد.")
+
+
 def get_stomach() -> int:
     try:
         with db_cursor() as c:
@@ -339,6 +347,17 @@ def fmt_time(s: float) -> str:
     return f"{s // 3600} ساعت و {(s % 3600) // 60} دقیقه"
 
 
+def fmt_timer_line(key: str, interval: int, enabled: bool) -> str:
+    """
+    نمایش صحیح خط تایمر با در نظر گرفتن وضعیت روشن/خاموش ماژول (مورد ۵):
+    اگر ماژول خاموش باشد، به‌جای «همین الان ✅» باید «🔴 خاموش» نمایش داده شود —
+    چون ماژول خاموش هرگز اجرا نخواهد شد و «همین الان» گمراه‌کننده است.
+    """
+    if not enabled:
+        return "🔴 خاموش"
+    return fmt_time(secs_left(key, interval))
+
+
 def onoff(flag: bool) -> str:
     return "🟢 روشن" if flag else "🔴 خاموش"
 
@@ -370,10 +389,6 @@ async def safe_send(gid: int, text: str, retries: int = 3) -> Optional[Message]:
 
 
 def is_bot(msg: Message, sender) -> bool:
-    """
-    True اگر فرستنده یکی از بات‌های آینه (TARGET_BOTS) باشد — چون این بازی چند بات
-    مشابه در گروه‌های مختلف دارد و هرکدام که در آن گروه فعال باشد باید شناسایی شود.
-    """
     uname = getattr(sender, "username", None)
     return bool(uname) and uname in TARGET_BOTS
 
@@ -389,6 +404,19 @@ def parse_stomach(text: str) -> Optional[int]:
 
 DURATION_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})")
 
+# الگوی اختصاصی «زمان باقی مانده» — مورد ۴: چون ممکن است در یک پیام چند عدد
+# با فرمت HH:MM:SS وجود داشته باشد (مثلاً یک زمان کلی و یک زمان باقی‌مانده)،
+# پارسر باید طوری بازنویسی شود که فقط زمانِ بعد از عبارت «زمان باقی مانده» را
+# بردارد، نه اولین HH:MM:SS پیدا شده در کل متن.
+REMAINING_TIME_RE = re.compile(
+    r"زمان\s*باقی\s*مانده\D{0,10}(\d{1,2}):(\d{2}):(\d{2})"
+)
+
+# ظرفیت انبار — مثال: «ظرفیت انبار : 0 / 25,000 محصول»
+WAREHOUSE_CAPACITY_RE = re.compile(
+    r"ظرفیت\s*انبار\s*:?\s*([\d,]+)\s*/\s*([\d,]+)"
+)
+
 
 def _normalize(text: Optional[str]) -> str:
     """حذف نیم‌فاصله برای ساده‌ترشدن تطبیق عبارات فارسی."""
@@ -396,19 +424,20 @@ def _normalize(text: Optional[str]) -> str:
 
 
 def parse_street_cats(text: str) -> Optional[int]:
-    """🐈 شما XXX پیشی خیابونی دارید"""
     m = re.search(r"شما\s+(\d+)\s+پیشی\s+خیابونی\s+دارید", _normalize(text))
     return int(m.group(1)) if m else None
 
 
 def parse_smuggle_count(text: str) -> Optional[Tuple[int, int]]:
-    """✨ تعداد پیشی های قاچاقی : X / 15  →  (X, 15)"""
     m = re.search(r"تعداد\s*پیشی\s*های\s*قاچاقی\s*:\s*(\d+)\s*/\s*(\d+)", _normalize(text))
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def parse_duration(text: str) -> Optional[int]:
-    """استخراج زمان HH:MM:SS از متن (زمان مورد نیاز قاچاق/کارخونه) و تبدیل آن به ثانیه."""
+    """
+    استخراج عمومی زمان HH:MM:SS از متن (برای مواردی که عبارت «زمان باقی مانده» وجود ندارد،
+    مثل صفحه انتخاب تعداد قاچاق). برای پارس اختصاصی کارخونه از parse_remaining_time استفاده شود.
+    """
     m = DURATION_RE.search(_normalize(text))
     if not m:
         return None
@@ -416,36 +445,140 @@ def parse_duration(text: str) -> Optional[int]:
     return h * 3600 + mn * 60 + s
 
 
+def parse_remaining_time(text: str) -> Optional[int]:
+    """
+    پارسر بازنویسی‌شده مخصوص «زمان باقی مانده» (مورد ۴).
+    مستقیماً روی عبارت «زمان باقی مانده» انکور می‌شود تا در صورت وجود چند
+    HH:MM:SS در یک پیام، همیشه زمان درست استخراج شود — نه اولین موردی که
+    به‌صورت اتفاقی در متن ظاهر می‌شود.
+    اگر عبارت «زمان باقی مانده» پیدا نشد، fallback به اولین HH:MM:SS متن.
+    """
+    t = _normalize(text)
+    m = REMAINING_TIME_RE.search(t)
+    if m:
+        h, mn, s = (int(x) for x in m.groups())
+        return h * 3600 + mn * 60 + s
+    # fallback ایمن — اگر برچسب دقیق پیدا نشد ولی زمانی در متن هست
+    return parse_duration(t)
+
+
+def parse_warehouse_stock(text: str) -> Optional[Tuple[int, int]]:
+    """
+    استخراج ظرفیت انبار از متنی مانند «ظرفیت انبار : 0 / 25,000 محصول» → (0, 25000).
+    اعداد شامل کاما (جداکننده هزارگان) هستند و باید قبل از تبدیل حذف شوند.
+    """
+    m = WAREHOUSE_CAPACITY_RE.search(_normalize(text))
+    if not m:
+        return None
+    current = int(m.group(1).replace(",", ""))
+    capacity = int(m.group(2).replace(",", ""))
+    return current, capacity
+
+
 def parse_market_price(text: str) -> Optional[int]:
-    """🛍 قیمت بازار: XX"""
     m = re.search(r"قیمت\s*بازار\D{0,10}(\d+)", _normalize(text))
     return int(m.group(1)) if m else None
 
 
 def is_arrested(text: str) -> bool:
-    """🚨 شما به جرم قاچاق ..."""
     return "به جرم قاچاق" in _normalize(text)
 
 
 def is_smuggle_success(text: str) -> bool:
-    """🐈 قاچاق پیشی ها با موفقیت انجام شد 🎉 (بدون دستگیری)"""
     t = _normalize(text)
     return "با موفقیت انجام شد" in t and "قاچاق" in t
 
 
 def is_fine_paid(text: str) -> bool:
-    """🧑‍⚖️ شما با موفقیت جریمه خود را پرداخت کردید"""
     t = _normalize(text)
     return "جریمه" in t and "پرداخت" in t and "موفقیت" in t
+
+
+def is_factory_in_progress(text: str) -> bool:
+    """
+    تشخیص حالت «در حال تولید» کارخونه (مورد ۱).
+    بر اساس متن نمونه:
+        🐱 کارخونه میویی 🏭
+        ✨ درحال تولید ...
+        ┘─ ⏳ زمان باقی مانده : HH:MM:SS
+    تشخیص روی عبارت «درحال تولید» (با یا بدون نیم‌فاصله) انجام می‌شود تا هم به
+    متن دکمه (FACTORY_INPROGRESS_TEXT) و هم به بدنه پیام مقاوم باشد.
+    """
+    t = _normalize(text)
+    return "حال تولید" in t
+
+
+# ══════════════════════════════════════════════════
+#  کش نام گروه‌ها (مورد ۷/۸) — get_entity با مدیریت خطا
+# ══════════════════════════════════════════════════
+
+async def resolve_group_name(gid: int) -> str:
+    """
+    دریافت نام یک گروه با get_entity، با کش کوتاه‌مدت برای جلوگیری از
+    فراخوانی مکرر (هر بار .وضعیت اجرا شود، نباید هر بار مستقیماً به سرور زده شود).
+    در صورت هر نوع خطا (گروه حذف‌شده، بن، عدم دسترسی، آیدی اشتباه) رشته
+    «❌ نامشخص» برگردانده می‌شود — هرگز crash نمی‌کند (مورد ۶/۷).
+    """
+    now = time.time()
+    cached = _entity_name_cache.get(gid)
+    if cached and (now - cached[1]) < _entity_cache_ttl:
+        return cached[0]
+
+    try:
+        entity = await client.get_entity(gid)
+        name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(gid)
+        _entity_name_cache[gid] = (name, now)
+        return name
+    except ChannelPrivateError:
+        log.warning(f"[GROUP] دسترسی به گروه {gid} وجود ندارد (ChannelPrivateError).")
+        result = "❌ دسترسی وجود ندارد"
+    except (ValueError, TypeError) as e:
+        log.warning(f"[GROUP] گروه {gid} پیدا نشد یا آیدی نامعتبر است: {e}")
+        result = "❌ گروه در دسترس نیست"
+    except Exception as e:
+        log.warning(f"[GROUP] خطای نامشخص هنگام دریافت اطلاعات گروه {gid}: {e}")
+        result = "❌ نامشخص"
+
+    _entity_name_cache[gid] = (result, now)
+    return result
+
+
+async def format_group_block(label: str, gid: int) -> str:
+    """
+    قالب نمایش یک گروه به‌صورت:
+        🐱 گروه میو:
+        └─ NameOrError
+        └─ -1003380347106
+    (مورد ۷)
+    """
+    name = await resolve_group_name(gid)
+    return f"{label}:\n└─ {name}\n└─ {gid}"
+
+
+async def format_rescue_groups_block(gids: List[int]) -> str:
+    """
+    قالب نمایش کامل تمام گروه‌های خیابونی (مورد ۸) — همه گروه‌ها بدون خلاصه‌سازی:
+        🏘 گروه‌های خیابونی:
+
+        └─ GroupName1
+        └─ -1001111111111
+
+        └─ GroupName2
+        └─ -1002222222222
+    """
+    if not gids:
+        return "🏘 گروه‌های خیابونی:\n└─ (هیچ گروهی تنظیم نشده)"
+
+    lines = ["🏘 گروه‌های خیابونی:"]
+    for gid in gids:
+        name = await resolve_group_name(gid)
+        lines.append(f"\n└─ {name}\n└─ {gid}")
+    return "\n".join(lines)
 
 
 async def wait_for_reply(
     gid: int, my_msg_id: int, has_buttons: set, timeout: int = WAIT_FOR_BOT
 ) -> Optional[Message]:
-    """
-    منتظر پیام جداگانه‌ای از TARGET_BOT می‌ماند که reply_to آن برابر my_msg_id باشد
-    (به‌جای گشتن دکمه روی پیام ارسالی خودمان).
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         await asyncio.sleep(1)
@@ -470,11 +603,6 @@ async def wait_for_reply(
 
 
 async def wait_for_bot_message(gid: int, my_msg_id: int, timeout: int = WAIT_FOR_BOT) -> Optional[Message]:
-    """
-    نسخه‌ی عمومی‌تر wait_for_reply — بدون فیلتر بر اساس متن دکمه.
-    برای قاچاق/کارخونه لازم است چون خیلی از دکمه‌ها متن ندارند.
-    منتظر هر پیامی از TARGET_BOT می‌ماند که reply آن my_msg_id باشد.
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         await asyncio.sleep(1)
@@ -497,10 +625,6 @@ async def wait_for_bot_message(gid: int, my_msg_id: int, timeout: int = WAIT_FOR
 
 
 async def refresh_message(chat_id: int, msg_id: int, tries: int = 6, delay: float = 0.7) -> Optional[Message]:
-    """
-    خواندن نسخه‌ی به‌روزشده‌ی پیام از سرور بعد از کلیک روی دکمه
-    (چون click() خودِ پیام ادیت‌شده را برنمی‌گرداند).
-    """
     for _ in range(tries):
         await asyncio.sleep(delay)
         try:
@@ -516,7 +640,6 @@ async def refresh_message(chat_id: int, msg_id: int, tries: int = 6, delay: floa
 
 def get_button(msg: Message, row: Optional[int] = None, col: Optional[int] = None,
                 text: Optional[str] = None):
-    """پیدا کردن آبجکت دکمه از msg.buttons — بر اساس (row, col) یا بر اساس متن. هرگز crash نمی‌کند."""
     if not msg.buttons:
         return None
     if row is not None and col is not None:
@@ -536,13 +659,6 @@ def get_button(msg: Message, row: Optional[int] = None, col: Optional[int] = Non
 
 
 async def raw_click(msg: Message, button) -> bool:
-    """
-    ارسال مستقیم Callback Query (Direct Callback Query Submission / Injecting Callback Data):
-    داده مخفی (data) خودِ دکمه مستقیماً استخراج و به تلگرام ارسال می‌شود — دقیقاً همان
-    درخواستی که خود تلگرام هنگام لمس دکمه می‌فرستد. چون این روش فقط به peer گروه نیاز
-    دارد (نه resolve دقیق کدام بات)، در گروه‌هایی که چند بات مختلف دارند و msg.click
-    معمولی خطا می‌دهد/کار نمی‌کند، پایدار باقی می‌ماند.
-    """
     if button is None:
         return False
     try:
@@ -561,12 +677,6 @@ async def raw_click(msg: Message, button) -> bool:
 
 
 async def click_button(msg: Message, row: int, col: int, fallback_text: Optional[str] = None) -> bool:
-    """
-    کلیک ایمن روی دکمه اینلاین با روش Callback Data مستقیم:
-    ۱) همیشه اول تلاش با ایندکس (row, col)
-    ۲) اگر ناموفق بود و fallback_text داده شده بود، تلاش با متن دکمه
-    ۳) اگر هر دو ناموفق بودند، فقط لاگ می‌شود — هیچ خطایی اجرای ربات را متوقف نمی‌کند
-    """
     btn = get_button(msg, row=row, col=col)
     if await raw_click(msg, btn):
         return True
@@ -583,7 +693,6 @@ async def click_button(msg: Message, row: int, col: int, fallback_text: Optional
 
 
 async def click_by_text(msg: Message, text: str) -> bool:
-    """کلیک ایمن فقط با متن دکمه — با همان روش Callback Data مستقیم."""
     btn = get_button(msg, text=text)
     if await raw_click(msg, btn):
         return True
@@ -592,7 +701,6 @@ async def click_by_text(msg: Message, text: str) -> bool:
 
 
 def _first_button_text(msg: Message) -> str:
-    """متن دکمه (0,0) در صورت وجود، وگرنه رشته خالی — هرگز crash نمی‌کند."""
     try:
         if msg.buttons and msg.buttons[0]:
             return (msg.buttons[0][0].text or "").strip()
@@ -644,6 +752,8 @@ def build_menu() -> str:
         "گروه اختصاصی قاچاق میویی\n\n"
         "▫️ .گروه_کارخونه [آیدی]\n"
         "گروه اختصاصی کارخونه میویی\n\n"
+        "▫️ .تایم_کارخونه [ثانیه]\n"
+        "تنظیم دستی و فوری تایمر کارخونه (بدون نیاز به ریستارت)\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🔌 کنترل ماژول‌ها\n\n"
         "▫️ .سلف روشن   ▫️ .سلف خاموش\n"
@@ -662,7 +772,8 @@ def build_menu() -> str:
         ".حداقل_قاچاق 5\n"
         ".حداکثر_قاچاق 15\n"
         ".حداقل_قیمت_فروش 55\n"
-        ".گروه_قاچاق -1001234567890\n\n"
+        ".گروه_قاچاق -1001234567890\n"
+        ".تایم_کارخونه 6000\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "📌 سیستم هوشمند ماهیگیری\n\n"
         "اگر مقدار شکم کمتر از حد تعیین‌شده باشد، ماهی به گربه داده می‌شود؛ "
@@ -670,69 +781,97 @@ def build_menu() -> str:
     )
 
 
-def build_status() -> str:
+async def build_status() -> str:
     mi = cfg_int("meow_sec")
     pi = cfg_int("pishi_sec")
     fi = cfg_int("fish_sec")
     threshold = cfg_int("stomach")
     stomach = get_stomach()
 
-    g_meow   = get_group("group_meow", DEFAULT_MEOW_GROUP)
-    g_pishi  = get_group("group_pishi", DEFAULT_PISHI_GROUP)
-    g_fish   = get_group("group_fish", DEFAULT_FISH_GROUP)
-    g_rescue = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
+    g_meow    = get_group("group_meow", DEFAULT_MEOW_GROUP)
+    g_pishi   = get_group("group_pishi", DEFAULT_PISHI_GROUP)
+    g_fish    = get_group("group_fish", DEFAULT_FISH_GROUP)
+    g_rescue  = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
     g_smuggle = get_group("smuggling_group", DEFAULT_SMUGGLING_GROUP)
     g_factory = get_group("factory_group", DEFAULT_FACTORY_GROUP)
 
     smuggling_wait = cfg_int("smuggling_wait_sec", 1800)
     factory_wait   = cfg_int("factory_wait_sec", 3600)
 
+    self_on      = cfg_bool("self_enabled")
+    meow_on      = cfg_bool("meow_enabled")
+    pishi_on     = cfg_bool("pishi_enabled")
+    fishing_on   = cfg_bool("fishing_enabled")
+    rescue_on    = cfg_bool("rescue_enabled")
+    smuggling_on = cfg_bool("smuggling_enabled")
+    factory_on   = cfg_bool("factory_enabled")
+
+    # مورد ۷: نام گروه‌ها کنار آیدی — همه با get_entity، خطاها هندل می‌شوند
+    meow_block    = await format_group_block("🐱 گروه میو", g_meow)
+    pishi_block   = await format_group_block("🐾 گروه پیشی", g_pishi)
+    fish_block    = await format_group_block("🎣 گروه ماهیگیری", g_fish)
+    smuggle_block = await format_group_block("📦 گروه قاچاق", g_smuggle)
+    factory_block = await format_group_block("🏭 گروه کارخونه", g_factory)
+
+    # مورد ۸: نمایش کامل گروه‌های خیابونی (بدون خلاصه‌سازی به تعداد)
+    rescue_block = await format_rescue_groups_block(g_rescue)
+
     return (
         "🤖 وضعیت کامل ربات\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"سلف: {onoff(cfg_bool('self_enabled'))}\n"
-        f"میو: {onoff(cfg_bool('meow_enabled'))}\n"
-        f"پیشی: {onoff(cfg_bool('pishi_enabled'))}\n"
-        f"ماهیگیری: {onoff(cfg_bool('fishing_enabled'))}\n"
-        f"خیابونی: {onoff(cfg_bool('rescue_enabled'))}\n"
-        f"قاچاق: {onoff(cfg_bool('smuggling_enabled'))}\n"
-        f"کارخونه: {onoff(cfg_bool('factory_enabled'))}\n\n"
+        f"سلف: {onoff(self_on)}\n"
+        f"میو: {onoff(meow_on)}\n"
+        f"پیشی: {onoff(pishi_on)}\n"
+        f"ماهیگیری: {onoff(fishing_on)}\n"
+        f"خیابونی: {onoff(rescue_on)}\n"
+        f"قاچاق: {onoff(smuggling_on)}\n"
+        f"کارخونه: {onoff(factory_on)}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🍖 شکم فعلی: {stomach}\n"
         f"🎯 آستانه شکم: {threshold}\n\n"
-        f"🐱 گروه میو: {g_meow}\n"
-        f"🐾 گروه پیشی: {g_pishi}\n"
-        f"🎣 گروه ماهیگیری: {g_fish}\n"
-        f"🏘 تعداد گروه‌های خیابونی: {len(g_rescue)}\n"
-        f"📦 گروه قاچاق: {g_smuggle}\n"
-        f"🏭 گروه کارخونه: {g_factory}\n\n"
+        f"{meow_block}\n\n"
+        f"{pishi_block}\n\n"
+        f"{fish_block}\n\n"
+        f"{rescue_block}\n\n"
+        f"{smuggle_block}\n\n"
+        f"{factory_block}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🔢 حداقل قاچاق: {cfg_int('smuggling_min')}\n"
         f"🔢 حداکثر قاچاق: {cfg_int('smuggling_max')}\n"
         f"💰 حداقل قیمت فروش: {cfg_int('min_sell_price')}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⏱ میو (هر {mi} ثانیه)\n └─ مانده: {fmt_time(secs_left('meow', mi))}\n\n"
-        f"⏱ پیشی (هر {pi} ثانیه)\n └─ مانده: {fmt_time(secs_left('pishi', pi))}\n\n"
-        f"⏱ ماهیگیری (هر {fi} ثانیه)\n └─ مانده: {fmt_time(secs_left('fishing', fi))}\n\n"
-        f"⏱ قاچاق\n └─ مانده: {fmt_time(secs_left('smuggling', smuggling_wait))}\n\n"
-        f"⏱ تولید کارخونه\n └─ مانده: {fmt_time(secs_left('factory', factory_wait))}"
+        f"⏱ میو (هر {mi} ثانیه)\n └─ مانده: {fmt_timer_line('meow', mi, meow_on)}\n\n"
+        f"⏱ پیشی (هر {pi} ثانیه)\n └─ مانده: {fmt_timer_line('pishi', pi, pishi_on)}\n\n"
+        f"⏱ ماهیگیری (هر {fi} ثانیه)\n └─ مانده: {fmt_timer_line('fishing', fi, fishing_on)}\n\n"
+        f"⏱ قاچاق\n └─ مانده: {fmt_timer_line('smuggling', smuggling_wait, smuggling_on)}\n\n"
+        f"⏱ تولید کارخونه\n └─ مانده: {fmt_timer_line('factory', factory_wait, factory_on)}"
     )
 
 
 def build_timers() -> str:
+    """
+    مورد ۵: در تایمرهای ماژول‌های خاموش، به‌جای «همین الان ✅» عبارت «🔴 خاموش» نمایش داده شود.
+    """
     mi = cfg_int("meow_sec")
     pi = cfg_int("pishi_sec")
     fi = cfg_int("fish_sec")
     si = cfg_int("smuggling_wait_sec", 1800)
     ki = cfg_int("factory_wait_sec", 3600)
+
+    meow_on      = cfg_bool("meow_enabled")
+    pishi_on     = cfg_bool("pishi_enabled")
+    fishing_on   = cfg_bool("fishing_enabled")
+    smuggling_on = cfg_bool("smuggling_enabled")
+    factory_on   = cfg_bool("factory_enabled")
+
     return (
         "⏳ تایمرهای فعال سیستم ⏳\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🐱 ارسال میو بعدی:\n └─ {fmt_time(secs_left('meow', mi))}\n\n"
-        f"🐾 ارسال پیشی بعدی:\n └─ {fmt_time(secs_left('pishi', pi))}\n\n"
-        f"🎣 ارسال ماهی بعدی:\n └─ {fmt_time(secs_left('fishing', fi))}\n\n"
-        f"📦 سیکل بعدی قاچاق:\n └─ {fmt_time(secs_left('smuggling', si))}\n\n"
-        f"🏭 سیکل بعدی کارخونه:\n └─ {fmt_time(secs_left('factory', ki))}"
+        f"🐱 ارسال میو بعدی:\n └─ {fmt_timer_line('meow', mi, meow_on)}\n\n"
+        f"🐾 ارسال پیشی بعدی:\n └─ {fmt_timer_line('pishi', pi, pishi_on)}\n\n"
+        f"🎣 ارسال ماهی بعدی:\n └─ {fmt_timer_line('fishing', fi, fishing_on)}\n\n"
+        f"📦 سیکل بعدی قاچاق:\n └─ {fmt_timer_line('smuggling', si, smuggling_on)}\n\n"
+        f"🏭 سیکل بعدی کارخونه:\n └─ {fmt_timer_line('factory', ki, factory_on)}"
     )
 
 
@@ -740,7 +879,6 @@ def build_timers() -> str:
 #  پارس دستورات فارسی (پنل کنترل درون-تلگرامی)
 # ══════════════════════════════════════════════════
 
-# دستورهای مقداردهی عددی/متنی: کلید فارسی → (کلید دیتابیس، نوع، برچسب نمایشی)
 SETTER_COMMANDS = {
     "میو":            ("meow_sec", "int", "فاصله ارسال میو"),
     "پیشی":           ("pishi_sec", "int", "فاصله دریافت میوپوینت"),
@@ -756,9 +894,10 @@ SETTER_COMMANDS = {
     "حداقل_قیمت_فروش": ("min_sell_price", "int", "حداقل قیمت فروش"),
     "گروه_قاچاق":      ("smuggling_group", "group", "گروه قاچاق"),
     "گروه_کارخونه":    ("factory_group", "group", "گروه کارخونه"),
+    # مورد ۲: دستور جدید تنظیم دستی تایمر کارخونه
+    "تایم_کارخونه":   ("factory_wait_sec", "int", "تایمر دستی کارخونه"),
 }
 
-# دستورهای روشن/خاموش: کلید فارسی → کلید دیتابیس
 TOGGLE_COMMANDS = {
     "سلف":       "self_enabled",
     "میو":       "meow_enabled",
@@ -768,6 +907,9 @@ TOGGLE_COMMANDS = {
     "قاچاق":     "smuggling_enabled",
     "کارخونه":   "factory_enabled",
 }
+
+# کلیدهایی که با تغییرشان باید یک اقدام لحظه‌ای اضافه (غیر از صرفِ cfg_set) انجام شود
+GROUP_KEY_TO_RESCUE_RELOAD = "group_rescue"
 
 
 async def handle_command(event) -> None:
@@ -789,15 +931,16 @@ async def handle_command(event) -> None:
 
     try:
         if cmd == "وضعیت":
-            await event.edit(build_status()); return
+            await event.edit(await build_status()); return
         if cmd == "تایمر":
             await event.edit(build_timers()); return
 
-        # روشن / خاموش کردن ماژول‌ها: مثل ".میو روشن" یا ".میو خاموش"
+        # روشن / خاموش کردن ماژول‌ها
         if rest in ("روشن", "خاموش") and cmd in TOGGLE_COMMANDS:
             db_key = TOGGLE_COMMANDS[cmd]
             new_val = rest == "روشن"
             cfg_bool_set(db_key, new_val)
+            log.info(f"[TOGGLE] ماژول '{cmd}' → {onoff(new_val)}")
             await event.edit(f"✅ {cmd} {onoff(new_val)} شد.")
             return
 
@@ -814,6 +957,13 @@ async def handle_command(event) -> None:
                     return
                 cfg_set(db_key, rest)
 
+                # مورد ۲: دستور .تایم_کارخونه باید علاوه بر ذخیره مقدار،
+                # تایمر فعلی را نیز فوراً ریست کند تا مقدار جدید از همین لحظه اعمال شود
+                # (بدون نیاز به منتظرماندن برای پایان سیکل قبلی یا ریستارت ربات).
+                if db_key == "factory_wait_sec":
+                    reset_timer("factory")
+                    log.info(f"[FACTORY] تایمر کارخونه دستی تنظیم شد: {rest} ثانیه — فوراً اعمال شد.")
+
             elif kind == "str":
                 cfg_set(db_key, rest)
 
@@ -825,6 +975,7 @@ async def handle_command(event) -> None:
                     await event.edit(f"❌ «{cmd}» باید یک آیدی گروه معتبر (عدد) باشد.")
                     return
                 cfg_set(db_key, cleaned)
+                log.info(f"[GROUP] گروه '{db_key}' تغییر کرد → {cleaned} (بدون نیاز به ریستارت)")
 
             elif kind == "group_list":
                 ids = [p.strip() for p in rest.split(",") if p.strip()]
@@ -833,6 +984,12 @@ async def handle_command(event) -> None:
                     await event.edit("❌ فرمت آیدی‌ها نامعتبر است. با کاما جدا کنید.")
                     return
                 cfg_set(db_key, ",".join(ids))
+
+                # مورد ۱۰: بروزرسانی لحظه‌ای لیسنر خیابونی — به محض تغییر .گروه_خیابونی
+                # باید event handler قبلی حذف و با لیست جدید دوباره ثبت شود.
+                if db_key == GROUP_KEY_TO_RESCUE_RELOAD:
+                    log.info(f"[GROUP] لیست گروه‌های خیابونی تغییر کرد → {ids}")
+                    rescue_groups_changed.set()
 
             await event.edit(f"✅ {label} به «{rest}» تغییر یافت و ذخیره شد.")
             return
@@ -866,6 +1023,8 @@ async def meow_loop() -> None:
             await asyncio.sleep(5)
             continue
 
+        # مورد ۱۱: خواندن مجدد interval/لیست/گروه در هر دور — تضمین می‌کند
+        # که مقدار جدید بلافاصله بعد از تغییر توسط دستور اعمال شود.
         interval = cfg_int("meow_sec", 245)
         choices = [x.strip() for x in cfg("meow_list", DEFAULT_CONFIG["meow_list"]).split(",") if x.strip()]
         if not choices:
@@ -976,13 +1135,6 @@ async def fishing_loop() -> None:
 # ══════════════════════════════════════════════════
 
 async def smuggling_cycle() -> str:
-    """
-    یک سیکل کامل قاچاق میویی.
-    خروجی:
-      "started" → سیکل با موفقیت شروع شد؛ باید به مدت زمان استخراج‌شده صبر کرد
-      "restart" → زندان/دریافت کارمزد resolve شد؛ باید بلافاصله دوباره شروع شود
-      "retry"   → خطا یا وضعیت ناشناخته؛ تلاش مجدد بعد از تاخیر کوتاه
-    """
     group = get_group("smuggling_group", DEFAULT_SMUGGLING_GROUP)
 
     sent = await safe_send(group, SMUGGLE_TRIGGER)
@@ -1003,19 +1155,16 @@ async def smuggling_cycle() -> str:
     for _ in range(SMUGGLE_MAX_STEPS):
         text = msg.text or ""
 
-        # ۱) دستگیری
         if is_arrested(text):
             log.info("[SMUGGLE] دستگیر شدیم — ورود به فرآیند زندان/جریمه.")
             await handle_prison(group)
             return "restart"
 
-        # ۲) موفقیت بدون دستگیری → دریافت کارمزد
         if is_smuggle_success(text):
             await click_button(msg, 0, 0, fallback_text=SMUGGLE_FEE_TEXT)
             log.info("[SMUGGLE] کارمزد دریافت شد ✓")
             return "restart"
 
-        # ۳) صفحه اول — نمایش پیشی‌های خیابونی + دکمه شروع
         cats = parse_street_cats(text)
         if cats is not None and msg.buttons:
             log.info(f"[SMUGGLE] پیشی‌های خیابونی: {cats} — کلیک شروع قاچاق")
@@ -1025,7 +1174,6 @@ async def smuggling_cycle() -> str:
                 msg = fresh
             continue
 
-        # ۴) صفحه انتخاب تعداد (X / سقف)
         counts = parse_smuggle_count(text)
         if counts is not None:
             current, cap = counts
@@ -1036,20 +1184,19 @@ async def smuggling_cycle() -> str:
                 last_wait = dur
 
             if current < eff_target:
-                await click_button(msg, 0, 2, fallback_text=None)  # دکمه افزایش — بدون متن
+                await click_button(msg, 0, 2, fallback_text=None)
                 fresh = await refresh_message(group, msg.id)
                 if fresh:
                     msg = fresh
                 continue
 
             if current > eff_target:
-                await click_button(msg, 0, 0, fallback_text=None)  # دکمه کاهش — بدون متن
+                await click_button(msg, 0, 0, fallback_text=None)
                 fresh = await refresh_message(group, msg.id)
                 if fresh:
                     msg = fresh
                 continue
 
-            # تعداد درست تنظیم شده → تایید نهایی و شروع واقعی قاچاق
             await click_button(msg, 1, 0, fallback_text=None)
             fresh = await refresh_message(group, msg.id)
             if fresh:
@@ -1066,7 +1213,6 @@ async def smuggling_cycle() -> str:
             log.info(f"[SMUGGLE] قاچاق شروع شد | تعداد={eff_target} | زمان={fmt_time(last_wait)}")
             return "started"
 
-        # وضعیت ناشناخته — بدون crash، فقط لاگ و خروج از این تلاش
         log.warning(f"[SMUGGLE] وضعیت پیام ناشناخته — رد شد: {text[:80]!r}")
         break
 
@@ -1075,7 +1221,6 @@ async def smuggling_cycle() -> str:
 
 
 async def handle_prison(group: int) -> None:
-    """مدیریت کامل حالت زندان میویی: ارسال، تایید ورود، پرداخت جریمه."""
     try:
         sent = await safe_send(group, PRISON_TRIGGER)
         if not sent:
@@ -1087,13 +1232,11 @@ async def handle_prison(group: int) -> None:
             log.warning("[SMUGGLE] پاسخی برای زندان میویی دریافت نشد.")
             return
 
-        # کلیک اول: ورود به صفحه‌ی تایید جریمه
         await click_button(msg, 0, 0, fallback_text=None)
         fresh = await refresh_message(group, msg.id)
         if fresh:
             msg = fresh
 
-        # کلیک دوم: تایید نهایی پرداخت جریمه
         await click_button(msg, 0, 0, fallback_text=None)
         fresh = await refresh_message(group, msg.id)
 
@@ -1137,8 +1280,13 @@ async def smuggling_loop() -> None:
 
 async def factory_cycle() -> str:
     """
-    یک سیکل تولید کارخونه میویی (فقط تولید — بررسی انبار/فروش کاملاً جدا و ساعتی است، در factory_price_watch_loop).
+    یک سیکل تولید کارخونه میویی.
     خروجی: "started" | "in_progress" | "retry"
+
+    مورد ۱ (بازطراحی کامل): اگر پیام نشان‌دهنده‌ی «در حال تولید» باشد، این تابع
+    باید فقط زمان باقی‌مانده را بخواند و ذخیره کند — بدون هیچ کلیک، بدون هیچ
+    refresh یا ورود به منوی دیگر، و بدون هیچ عملیاتی که احتمال لغو تولید در حال
+    انجام را داشته باشد. این چک باید *قبل* از هرگونه کلیک روی پیام انجام شود.
     """
     group = get_group("factory_group", DEFAULT_FACTORY_GROUP)
 
@@ -1152,24 +1300,26 @@ async def factory_cycle() -> str:
         log.warning("[FACTORY] پاسخی از بات دریافت نشد.")
         return "retry"
 
-    btn0 = _first_button_text(msg)
+    raw_text = msg.text or ""
 
+    # ── حالت «در حال تولید»: فقط خواندن متن — هیچ کلیکی مجاز نیست ──
+    if is_factory_in_progress(raw_text):
+        remaining = parse_remaining_time(raw_text)
+        wait_sec = remaining if remaining is not None else cfg_int("factory_wait_sec", 3600)
+
+        cfg_set("factory_wait_sec", str(wait_sec))
+        set_last_run("factory", time.time())
+        log.info(
+            f"[FACTORY] تشخیص داده شد که تولید در حال انجام است | "
+            f"زمان باقی‌مانده استخراج‌شده={fmt_time(wait_sec)} | "
+            f"هیچ کلیک یا refresh اضافه‌ای انجام نشد."
+        )
+        return "in_progress"
+
+    # ── از این‌جا به بعد، تولید در حال انجام نیست → شروع تولید جدید مجاز است ──
     try:
-        if FACTORY_INPROGRESS_TEXT in btn0:
-            # در حال تولید — فقط زمان باقی‌مانده را می‌خوانیم و ذخیره می‌کنیم.
-            # نکته مهم: بعد از این، دیگر هیچ کلیک دیگری روی این پیام زده نمی‌شود
-            # تا تولید در حال انجام به‌اشتباه لغو نشود.
-            await click_button(msg, 0, 0, fallback_text=FACTORY_INPROGRESS_TEXT)
-            fresh = await refresh_message(group, msg.id)
-            remaining = parse_duration((fresh.text if fresh else msg.text) or "")
-            wait_sec = remaining if remaining is not None else cfg_int("factory_wait_sec", 3600)
+        log.info("[FACTORY] تولید در حال انجام نیست — شروع فرآیند تولید جدید (تولیدی هواپیما).")
 
-            cfg_set("factory_wait_sec", str(wait_sec))
-            set_last_run("factory", time.time())
-            log.info(f"[FACTORY] تولید در حال انجام است | باقی‌مانده={fmt_time(wait_sec)} | بدون کلیک اضافه")
-            return "in_progress"
-
-        # شروع یک تولید جدید (تولیدی هواپیما)
         await click_button(msg, 0, 0, fallback_text=FACTORY_PRODUCE_TEXT)
         fresh = await refresh_message(group, msg.id)
         if fresh:
@@ -1190,14 +1340,14 @@ async def factory_cycle() -> str:
         if fresh:
             msg = fresh
 
-        dur = parse_duration(msg.text or "")
+        dur = parse_remaining_time(msg.text or "")
         wait_sec = dur if dur is not None else cfg_int("factory_wait_sec", 3600)
 
         await click_button(msg, 0, 0, fallback_text=FACTORY_START_TEXT)
 
         cfg_set("factory_wait_sec", str(wait_sec))
         set_last_run("factory", time.time())
-        log.info(f"[FACTORY] تولید هواپیما شروع شد | زمان={fmt_time(wait_sec)}")
+        log.info(f"[FACTORY] تولید هواپیما با موفقیت شروع شد | زمان={fmt_time(wait_sec)}")
         return "started"
     except Exception as e:
         log.error(f"[FACTORY] خطا در بخش تولید: {e}")
@@ -1205,18 +1355,43 @@ async def factory_cycle() -> str:
 
 
 async def factory_warehouse_check(group: int) -> None:
-    """ورود به انبار، بررسی قیمت بازار، و فروش خودکار محصول در صورت رسیدن به آستانه."""
+    """
+    ورود به انبار، بررسی ظرفیت، و در صورت غیرخالی بودن، بررسی قیمت بازار و فروش خودکار.
+
+    مورد ۳: قبل از ورود به مسیر محصول→بازار→فروش، ابتدا ظرفیت انبار خوانده می‌شود.
+    اگر مقدار فعلی انبار صفر باشد (مثلاً «ظرفیت انبار : 0 / 25,000 محصول»)، هیچ کلیک
+    اضافه‌ای انجام نمی‌شود، وارد بخش محصول/بازار/فروش نمی‌شویم، فقط لاگ ثبت و تابع
+    خاتمه می‌یابد.
+    """
     sent = await safe_send(group, FACTORY_TRIGGER)
     if not sent:
+        log.warning(f"[FACTORY] ارسال «{FACTORY_TRIGGER}» برای بررسی انبار ناموفق بود.")
         return
     msg = await wait_for_bot_message(group, sent.id)
     if not msg:
+        log.warning("[FACTORY] پاسخی برای بررسی انبار دریافت نشد.")
+        return
+
+    # اگر همزمان تولید در حال انجام بود، از ورود به انبار صرف‌نظر می‌کنیم تا
+    # هیچ کلیکی که ممکن است تداخل ایجاد کند زده نشود.
+    if is_factory_in_progress(msg.text or ""):
+        log.info("[FACTORY] هنگام بررسی انبار مشخص شد تولید در حال انجام است — بررسی قیمت لغو شد.")
         return
 
     await click_by_text(msg, WAREHOUSE_TEXT)
     fresh = await refresh_message(group, msg.id)
     if fresh:
         msg = fresh
+
+    stock = parse_warehouse_stock(msg.text or "")
+    if stock is not None:
+        current, capacity = stock
+        if current <= 0:
+            log.info("[FACTORY] انبار خالی است — بررسی قیمت انجام نشد")
+            return
+        log.info(f"[FACTORY] ظرفیت انبار: {current} / {capacity} — ادامه به بررسی قیمت بازار.")
+    else:
+        log.warning("[FACTORY] ظرفیت انبار قابل تشخیص نبود — به‌صورت احتیاطی ادامه داده می‌شود.")
 
     await click_button(msg, 1, 0, fallback_text=None)
     fresh = await refresh_message(group, msg.id)
@@ -1236,23 +1411,19 @@ async def factory_warehouse_check(group: int) -> None:
         return
 
     if price >= threshold:
-        log.info(f"[FACTORY] قیمت بازار={price} ≥ آستانه={threshold} → فروش محصول")
+        log.info(f"[FACTORY] قیمت بازار={price} ≥ آستانه={threshold} → شروع فروش محصول")
         await click_button(msg, 0, 0, fallback_text=SELL_PRODUCT_TEXT)
         fresh = await refresh_message(group, msg.id)
         if fresh and fresh.buttons:
             await click_button(fresh, 0, 0, fallback_text=None)
-            log.info("[FACTORY] فروش تایید شد ✓")
+            log.info("[FACTORY] فروش با موفقیت تایید شد ✓")
         else:
-            log.info("[FACTORY] فروش انجام شد ✓")
+            log.info("[FACTORY] فروش با موفقیت انجام شد ✓")
     else:
         log.info(f"[FACTORY] قیمت بازار={price} < آستانه={threshold} → فروشی انجام نشد")
 
 
 def seconds_until_next_31() -> float:
-    """
-    ثانیه‌های باقی‌مانده تا دقیقه ۳۱ ساعت جاری (یا ساعت بعد اگر رد شده باشیم) —
-    چون قیمت بازار هر ساعت، سرِ دقیقه ۳۱ به‌روزرسانی می‌شود.
-    """
     now_ts = time.time()
     now = time.localtime(now_ts)
     this_hour_31 = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, 31, 0, 0, 0, -1))
@@ -1262,10 +1433,6 @@ def seconds_until_next_31() -> float:
 
 
 async def factory_price_watch_loop() -> None:
-    """
-    حلقه‌ای کاملاً مستقل از چرخه تولید: دقیقاً سرِ دقیقه ۳۱ هر ساعت (۱:۳۱، ۲:۳۱، ۳:۳۱، ...)
-    قیمت بازار انبار را چک می‌کند. اگر به آستانه نرسیده باشد، هیچ کلیکی (حتی برای فروش) زده نمی‌شود.
-    """
     while True:
         wait = seconds_until_next_31()
         log.info(f"[FACTORY-PRICE] {fmt_time(wait)} تا بررسی بعدی قیمت بازار (ساعت:۳۱)")
@@ -1312,21 +1479,18 @@ async def factory_loop() -> None:
 
 
 # ══════════════════════════════════════════════════
-#  Rescue Listener
+#  Rescue Listener — با پشتیبانی از بروزرسانی لحظه‌ای (مورد ۱۰)
 # ══════════════════════════════════════════════════
 
 async def sniper_click(msg: Message, action_type: str):
     raw_text = msg.text or ""
 
-    # بررسی متن برای اطمینان از حضور پیشی خیابونی و اینکه قبلاً توسط کسی گرفته نشده باشه
     if ("یک پیشی خیابونی توی شهر پیدا شد" in raw_text or "لطفا به پیشی" in raw_text) and "نجات داد" not in raw_text:
         if msg.buttons:
             for r_idx, row in enumerate(msg.buttons):
                 for c_idx, btn in enumerate(row):
                     if "نجات پیشی" in btn.text:
                         log.info(f"🎯 [پیشی شکار شد! ({action_type})] ──> ارسال فوری کلیک...")
-
-                        # ارسال ۲ کلیک رگباری بسیار سریع بدون بلاک شدن توسط تلگرام
                         for _ in range(2):
                             client.loop.create_task(btn.click())
                         return True
@@ -1334,22 +1498,52 @@ async def sniper_click(msg: Message, action_type: str):
 
 
 async def rescue_listener() -> None:
+    """
+    مورد ۱۰: به‌جای ثبت یک‌بارِ ثابت در استارت برنامه، این حلقه بیرونی هر بار که
+    .گروه_خیابونی تغییر کند (از طریق rescue_groups_changed.set() در handle_command)
+    هندلرهای قبلی را remove_event_handler می‌کند و با لیست جدید دوباره ثبت می‌کند —
+    بدون نیاز به ریستارت یا reconnect.
+    """
+    current_handlers: list = []
+
+    def _register(groups: list):
+        bot_list = list(TARGET_BOTS)
+
+        async def handle_new_msg(event):
+            if not cfg_bool("rescue_enabled"):
+                return
+            await sniper_click(event.message, "پیام جدید")
+
+        async def handle_edited_msg(event):
+            if not cfg_bool("rescue_enabled"):
+                return
+            await sniper_click(event.message, "پیام ادیت‌شده/فرصت مجدد")
+
+        client.add_event_handler(handle_new_msg, events.NewMessage(chats=groups, from_users=bot_list))
+        client.add_event_handler(handle_edited_msg, events.MessageEdited(chats=groups, from_users=bot_list))
+        return [handle_new_msg, handle_edited_msg]
+
+    def _unregister(handlers: list):
+        for h in handlers:
+            try:
+                client.remove_event_handler(h)
+            except Exception as e:
+                log.warning(f"[RESCUE] خطا در حذف هندلر قدیمی: {e}")
+
     rescue_groups = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
-    bot_list = list(TARGET_BOTS)
+    current_handlers = _register(rescue_groups)
+    log.info(f"[RESCUE] لیسنر خیابونی ثبت شد برای گروه‌ها: {rescue_groups}")
 
-    @client.on(events.NewMessage(chats=rescue_groups, from_users=bot_list))
-    async def handle_new_msg(event):
-        if not cfg_bool("rescue_enabled"):
-            return
-        await sniper_click(event.message, "پیام جدید")
+    while True:
+        await rescue_groups_changed.wait()
+        rescue_groups_changed.clear()
 
-    @client.on(events.MessageEdited(chats=rescue_groups, from_users=bot_list))
-    async def handle_edited_msg(event):
-        if not cfg_bool("rescue_enabled"):
-            return
-        await sniper_click(event.message, "پیام ادیت‌شده/فرصت مجدد")
+        new_groups = get_group_list("group_rescue", DEFAULT_RESCUE_GROUPS)
+        log.info(f"[RESCUE] تغییر گروه‌های خیابونی شناسایی شد — بروزرسانی لیسنر بدون ریستارت.")
 
-    await client.run_until_disconnected()
+        _unregister(current_handlers)
+        current_handlers = _register(new_groups)
+        log.info(f"[RESCUE] لیسنر خیابونی مجدداً ثبت شد برای گروه‌های جدید: {new_groups}")
 
 
 # ══════════════════════════════════════════════════
@@ -1362,7 +1556,6 @@ async def command_listener() -> None:
         text = (event.message.text or "").strip()
         if text == MENU_TRIGGER or text.startswith("."):
             if not cfg_bool("self_enabled") and text != MENU_TRIGGER:
-                # حتی اگر سلف خاموش باشد، خود دستور خاموش/روشن باید کار کند
                 if text not in (".سلف روشن", ".سلف خاموش"):
                     return
             await handle_command(event)
