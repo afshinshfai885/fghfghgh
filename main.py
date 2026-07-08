@@ -1486,14 +1486,65 @@ async def sniper_click(msg: Message, action_type: str):
     raw_text = msg.text or ""
 
     if ("یک پیشی خیابونی توی شهر پیدا شد" in raw_text or "لطفا به پیشی" in raw_text) and "نجات داد" not in raw_text:
+        
+        log.info(f"🎯 [پیشی شکار شد!] ──> شروع فاز اول ترکیبی (کلیک + ری‌اکشن)...")
+        
+        try:
+            # ۱. ری‌اکشن قلب اول
+            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')])))
+            
+            # ۲. کلیک اول
+            client.loop.create_task(msg.click(0, 0))
+            
+            # ۳. حذف ری‌اکشن اول (فرستادن لیست خالی [] یعنی پاک کردن ری‌اکشن)
+            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[])))
+            
+            # ۴. کلیک دوم
+            client.loop.create_task(msg.click(0, 0))
+            
+            # ۵. ری‌اکشن قلب دوم
+            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')])))
+            
+            # ۶. کلیک سوم
+            client.loop.create_task(msg.click(0, 0))
+            
+            # ۷. حذف ری‌اکشن دوم
+            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[])))
+            
+            log.info("⚡️ فاز اول ترکیبی با موفقیت در کسری از ثانیه شلیک شد.")
+            
+        except Exception as e:
+            log.error(f"خطا در شلیک اولیه: {e}")
+
+        # ----------------------------------------
+        # مهلت به سرور بازی و آپدیت وضعیت پیام
+        await asyncio.sleep(1.0)
+        msg = await client.get_messages(msg.chat_id, ids=msg.id)
+
+        # 🛡 فاز دوم (پیگیری امن در صورت غیب نشدن دکمه)
         if msg.buttons:
-            for r_idx, row in enumerate(msg.buttons):
-                for c_idx, btn in enumerate(row):
-                    if "نجات پیشی" in btn.text:
-                        log.info(f"🎯 [پیشی شکار شد! ({action_type})] ──> ارسال فوری کلیک...")
-                        for _ in range(2):
-                            client.loop.create_task(btn.click())
-                        return True
+            log.info("⚠️ دکمه هنوز هست؛ ورود به فاز دوم (۱۵ کلیک امن با تایمر)...")
+            max_attempts = 15
+            attempt = 0
+            
+            while msg.buttons and attempt < max_attempts:
+                attempt += 1
+                try:
+                    client.loop.create_task(msg.click(0, 0))
+                    await asyncio.sleep(0.5)
+                    msg = await client.get_messages(msg.chat_id, ids=msg.id)
+                except Exception as e:
+                    log.error(f"❌ خطا در فاز دوم: {e}")
+                    break
+
+        # نتیجه نهایی
+        if not msg.buttons:
+            log.info("✅ عالیه! دکمه با موفقیت غیب شد.")
+            return True
+        else:
+            log.warning("🛑 دکمه غیب نشد. ربات رفت خونش.")
+            return False
+
     return False
 
 
