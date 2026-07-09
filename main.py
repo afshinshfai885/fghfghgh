@@ -12,7 +12,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Optional, Iterator, Tuple, List
-
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import ReactionEmoji
 from telethon import TelegramClient, events
 from telethon.tl.custom.message import Message
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
