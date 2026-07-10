@@ -661,15 +661,15 @@ WAREHOUSE_CAPACITY_RE = re.compile(
 
 def _normalize(text: Optional[str]) -> str:
     """
-    حذف نیم‌فاصله و نشانه‌های نامرئی جهت‌دهی متن (RLM/LRM/ALM) برای
-    ساده‌ترشدن تطبیق عبارات فارسی — برخی پیام‌های ربات‌های بازی (از جمله یخچال
-    میویی) این کاراکترهای نامرئی را ابتدای خطوط می‌گذارند که می‌توانند باعث
-    عدم تطبیق دقیق ریجکس‌ها شوند. حذف آن‌ها کاملاً بی‌خطر است چون تاثیری روی
-    محتوای قابل‌مشاهده ندارند.
+    حذف نیم‌فاصله، نشانه‌های نامرئی جهت‌دهی متن (RLM/LRM/ALM)، و بک‌تیک‌های
+    مارک‌داون (`) که ربات‌های هدف اغلب دور اعداد می‌گذارند (مثلاً «ظرفیت یخچال :
+    `0` / `3`»). حذف این کاراکترها کاملاً بی‌خطر است — هیچ‌کدام تاثیری روی
+    محتوای عددی/متنی قابل‌مشاهده ندارند و فقط برای ساده‌ترشدن تطبیق ریجکس‌ها
+    حذف می‌شوند.
     """
     t = text or ""
     t = t.replace("\u200c", " ")
-    for ch in ("\u200e", "\u200f", "\u061c"):
+    for ch in ("\u200e", "\u200f", "\u061c", "`"):
         t = t.replace(ch, "")
     return t
 
@@ -835,6 +835,11 @@ def parse_cook_duration(text: str) -> Optional[int]:
 def is_cooked_label(text: str) -> bool:
     """آیا برچسب وضعیت ماهی «پخته شده» است؟"""
     return "پخته" in _normalize(text)
+
+
+def is_fridge_empty(text: str) -> bool:
+    """آیا پیام یخچال میویی صراحتاً «یخچال خالی است» را نشان می‌دهد؟"""
+    return "یخچال خالی است" in _normalize(text)
 
 
 def parse_fridge_entries(text: str) -> List[dict]:
@@ -2094,6 +2099,14 @@ async def fridge_initiate_cook(group: int, emo: str) -> bool:
     listing_text = msg.text or ""
     _sync_capacity_from_text(listing_text)
 
+    if is_fridge_empty(listing_text):
+        log.warning(
+            f"[FRIDGE] یخچال واقعی خالی است ولی دیتابیس محلی ماهی '{emo}' را دارد — "
+            f"رکورد محلی ناهماهنگ حذف شد (خودترمیمی)."
+        )
+        fridge_remove(emo)
+        return False
+
     entries = parse_fridge_entries(listing_text)
     idx = next((i for i, e in enumerate(entries) if e["emoji"] == emo), None)
     if idx is None:
@@ -2148,6 +2161,14 @@ async def fridge_collect_cooked(group: int, emo: str) -> bool:
 
     listing_text = msg.text or ""
     _sync_capacity_from_text(listing_text)
+
+    if is_fridge_empty(listing_text):
+        log.warning(
+            f"[FRIDGE] یخچال واقعی خالی است ولی دیتابیس محلی ماهی '{emo}' را دارد — "
+            f"رکورد محلی ناهماهنگ حذف شد (خودترمیمی)."
+        )
+        fridge_remove(emo)
+        return False
 
     entries = parse_fridge_entries(listing_text)
     idx = next((i for i, e in enumerate(entries) if e["emoji"] == emo), None)
