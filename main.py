@@ -2316,31 +2316,36 @@ async def sniper_click(msg: Message, action_type: str):
         
         try:
             # ۱. ری‌اکشن قلب اول
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')])))
-            
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')]))
+            await asyncio.sleep(0.9)
+
             # ۲. کلیک اول
-            client.loop.create_task(msg.click(0, 0))
-            
-            # ۳. حذف ری‌اکشن اول (فرستادن لیست خالی [] یعنی پاک کردن ری‌اکشن)
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[])))
-            
+            await msg.click(0, 0)
+            await asyncio.sleep(0.5)
+
+            # ۳. حذف ری‌اکشن اول
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[]))
+            await asyncio.sleep(0.5)
+
             # ۴. کلیک دوم
-            client.loop.create_task(msg.click(0, 0))
-            
+            await msg.click(0, 0)
+            await asyncio.sleep(0.5)
+
             # ۵. ری‌اکشن قلب دوم
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')])))
-            
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[ReactionEmoji(emoticon='❤️')]))
+            await asyncio.sleep(0.5)
+
             # ۶. کلیک سوم
-            client.loop.create_task(msg.click(0, 0))
-            
+            await msg.click(0, 0)
+            await asyncio.sleep(0.5)
+
             # ۷. حذف ری‌اکشن دوم
-            client.loop.create_task(client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[])))
+            await client(SendReactionRequest(peer=msg.chat_id, msg_id=msg.id, reaction=[]))
             
-            log.info("⚡️ فاز اول ترکیبی با موفقیت در کسری از ثانیه شلیک شد.")
-            
+            log.info("⚡️ فاز اول ترکیبی با موفقیت انجام شد.")
+
         except Exception as e:
             log.error(f"خطا در شلیک اولیه: {e}")
-
         # ----------------------------------------
         # مهلت به سرور بازی و آپدیت وضعیت پیام
         await asyncio.sleep(1.0)
