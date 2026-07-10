@@ -421,6 +421,22 @@ def fridge_remove(emoji: str) -> None:
         log.error(f"[FRIDGE-DB] خطا در حذف '{emoji}': {e}")
 
 
+def fridge_reset_all() -> None:
+    """
+    پاک‌سازی کامل جدول محلی یخچال — طبق درخواست کاربر، هر بار ماژول یخچال از
+    خاموش به روشن تغییر می‌کند، دیتابیس محلی کاملاً خالی می‌شود تا در دور بعدی
+    fridge_loop، سینک از صفر و کامل انجام شود (fridge_sync_if_empty) و هیچ
+    رکورد قدیمی/ناهماهنگ باقی نماند.
+    """
+    try:
+        with db_cursor() as c:
+            c.execute("DELETE FROM meow_refrigerator")
+        cfg_set("fridge_capacity_max", "0")
+        log.info("[FRIDGE-DB] دیتابیس محلی یخچال کاملاً پاک شد — سینک کامل در دور بعدی انجام می‌شود.")
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در پاک‌سازی کامل: {e}")
+
+
 def fridge_set_status(
     emoji: str,
     status: str,
@@ -1358,6 +1374,13 @@ async def handle_command(event) -> None:
             new_val = rest == "روشن"
             cfg_bool_set(db_key, new_val)
             log.info(f"[TOGGLE] ماژول '{cmd}' → {onoff(new_val)}")
+
+            # طبق درخواست کاربر: هر بار یخچال روشن می‌شود، دیتابیس محلی کاملاً
+            # ریست می‌شود تا سینک از صفر و کامل با یخچال واقعی انجام شود.
+            if db_key == "refrigerator_enabled" and new_val:
+                fridge_reset_all()
+                log.info("[FRIDGE] به‌خاطر روشن‌شدن مجدد ماژول، لیست یخچال به‌طور کامل ریست شد.")
+
             await event.edit(f"✅ {cmd} {onoff(new_val)} شد.")
             return
 
@@ -1511,7 +1534,7 @@ async def pishi_loop() -> None:
         await asyncio.sleep(interval)
 
 
-async def try_store_in_fridge(msg: Message, catch_text: str) -> bool:
+async def try_store_in_fridge(msg: Message, catch_text: str, fish_group: int) -> bool:
     """
     بررسی ۴ شرط ذخیره در یخچال (سند یخچال، مورد ۴) روی متن پیام صید ماهی:
       ۱) ماژول یخچال روشن باشد — این را خودِ فراخوان (fishing_loop) از قبل چک می‌کند.
@@ -1519,8 +1542,8 @@ async def try_store_in_fridge(msg: Message, catch_text: str) -> bool:
       ۳) نوع ماهی (ایموجی) از قبل در یخچال (محلی) نباشد.
       ۴) ظرفیت یخچال پر نباشد.
     در صورت برقرار بودن همه، روی «بندازش تو یخچال» کلیک و ماهی در دیتابیس محلی
-    ثبت می‌شود (وضعیت 'raw'). ادامه‌ی فرآیند پخت/فروش/تغذیه به‌طور کامل توسط
-    fridge_loop مدیریت می‌شود (جداسازی کامل مسئولیت‌ها).
+    ثبت می‌شود (وضعیت 'raw'). سپس — طبق درخواست کاربر — بلافاصله (بدون منتظر
+    ماندن برای دور بعدی fridge_loop) فرآیند شروع پخت هم در همین‌جا اجرا می‌شود.
     خروجی: True یعنی ماهی به یخچال منتقل شد؛ False یعنی fishing_loop باید طبق
     روال سابق (فروش/تغذیه فوری) ادامه دهد.
     """
@@ -1552,7 +1575,25 @@ async def try_store_in_fridge(msg: Message, catch_text: str) -> bool:
         return False
 
     fridge_add(fish_emo)
-    log.info(f"[FRIDGE] ماهی '{fish_emo}' با موفقیت به یخچال منتقل شد ✓ (فرآیند پخت را fridge_loop ادامه می‌دهد)")
+    log.info(f"[FRIDGE] ماهی '{fish_emo}' با موفقیت به یخچال منتقل شد ✓ — بلافاصله شروع پخت را امتحان می‌کنیم.")
+
+    # طبق درخواست کاربر: به‌جای صبر برای دور بعدی fridge_loop، همین الان تلاش
+    # می‌کنیم فرآیند پخت را شروع کنیم. یک مکث کوتاه می‌دهیم تا پیام «بندازش تو
+    # یخچال» واقعاً روی سرور بازی اعمال شده باشد.
+    await asyncio.sleep(2)
+    try:
+        started = await fridge_initiate_cook(fish_group, fish_emo)
+        fridge_record_attempt(fish_emo, started)
+        if started:
+            log.info(f"[FRIDGE] پخت ماهی '{fish_emo}' بلافاصله بعد از ذخیره شروع شد ✓")
+        else:
+            log.info(
+                f"[FRIDGE] شروع فوری پخت برای '{fish_emo}' موفق نشد — fridge_loop در دورهای "
+                f"بعدی دوباره تلاش می‌کند."
+            )
+    except Exception as e:
+        log.error(f"[FRIDGE] خطا در تلاش برای شروع فوری پخت '{fish_emo}': {e}")
+
     return True
 
 
@@ -1596,7 +1637,11 @@ async def fishing_loop() -> None:
                 used_fridge = False
 
                 if cfg_bool("refrigerator_enabled", False):
-                    used_fridge = await try_store_in_fridge(msg, catch_text)
+                    fridge_group = get_group("refrigerator_group")
+                    if fridge_group is not None:
+                        used_fridge = await try_store_in_fridge(msg, catch_text, fridge_group)
+                    else:
+                        log.warning("[FRIDGE] گروه یخچال تنظیم نشده — ذخیره در یخچال رد شد.")
 
                 if not used_fridge:
                     # بک‌آپ: روال دقیقاً طبق سابق (یخچال خاموش بود یا این صید واجد شرایط نبود)
