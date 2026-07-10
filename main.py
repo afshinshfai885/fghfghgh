@@ -144,6 +144,7 @@ DEFAULT_TOGGLES = {
     "smuggling_enabled":    "0",
     "factory_enabled":      "0",
     "refrigerator_enabled": "0",
+    "fridge_synced_once":   "0",
 }
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -424,16 +425,16 @@ def fridge_remove(emoji: str) -> None:
 def fridge_reset_all() -> None:
     """
     پاک‌سازی کامل جدول محلی یخچال — طبق درخواست کاربر، هر بار ماژول یخچال از
-    خاموش به روشن تغییر می‌کند، دیتابیس محلی کاملاً خالی می‌شود تا در دور بعدی
-    fridge_loop، سینک از صفر و کامل انجام شود (fridge_sync_if_empty) و هیچ
-    رکورد قدیمی/ناهماهنگ باقی نماند.
+    خاموش به روشن تغییر می‌کند، دیتابیس محلی کاملاً خالی می‌شود و پرچم
+    fridge_synced_once هم پاک می‌شود تا دقیقاً یک سینک تازه (fridge_sync_if_empty)
+    در دور بعدی fridge_loop انجام شود — نه کمتر، نه بیشتر.
     """
     try:
         with db_cursor() as c:
             c.execute("DELETE FROM meow_refrigerator")
         cfg_set("fridge_capacity_max", "0")
-        cfg_set("fridge_last_sync_at", "")
-        log.info("[FRIDGE-DB] دیتابیس محلی یخچال کاملاً پاک شد — سینک کامل در دور بعدی انجام می‌شود.")
+        cfg_bool_set("fridge_synced_once", False)
+        log.info("[FRIDGE-DB] دیتابیس محلی یخچال کاملاً پاک شد — یک سینک تازه در دور بعدی انجام می‌شود.")
     except sqlite3.Error as e:
         log.error(f"[FRIDGE-DB] خطا در پاک‌سازی کامل: {e}")
 
@@ -1081,24 +1082,27 @@ def _first_button_text(msg: Message) -> str:
     return ""
 
 
-def get_anonymous_buttons_flat(msg: Message) -> list:
-    """
-    دکمه‌های شیشه‌ای «بدون متن» یخچال را به ترتیب ردیف/ستون flatten می‌کند
-    (مورد ۵). دکمه‌هایی که متن دارند (مثل «ارتقا سطح یخچال») از این لیست حذف
-    می‌شوند، چون طبق سند فقط دکمه‌های آنانیم به ترتیب با لیست ماهی‌های متن پیام
-    (parse_fridge_entries) مطابقت دارند. کلیک روی این دکمه‌ها چون متن ندارند
-    نمی‌تواند از click_by_text انجام شود؛ raw_click مستقیماً روی خودِ دکمه زده
-    می‌شود.
-    """
-    if not msg.buttons:
-        return []
-    flat = []
-    for row in msg.buttons:
-        for b in row:
-            btxt = (getattr(b, "text", "") or "").strip()
-            if not btxt:
-                flat.append(b)
-    return flat
+# ══════════════════════════════════════════════════
+#  موقعیت دکمه‌های آنانیم یخچال (بدون هیچ متنی)
+# ══════════════════════════════════════════════════
+#
+# طبق تایید صریح کاربر: این دکمه‌ها اصلاً متن ندارند و فقط بر اساس «موقعیت»
+# شناسایی می‌شوند — نه با اسکن‌کردن پیام برای دکمه‌های خالی. قانون دقیق:
+#   • اگر دکمه‌ی متنی «ارتقا سطح یخچال» در پیام نباشد:
+#       ماهی اول → ردیف ۰ ستون ۰ | ماهی دوم → ردیف ۰ ستون ۱ | ...
+#   • اگر آن دکمه باشد (ردیف ۰ را اشغال کرده):
+#       ماهی اول → ردیف ۱ ستون ۰ | ماهی دوم → ردیف ۱ ستون ۱ | ...
+# یعنی ستون همیشه = ایندکس ماهی در لیست متن (0-based)، و فقط ردیف بر اساس
+# وجود/عدم‌وجود دکمه‌ی ارتقا بین ۰ و ۱ جابه‌جا می‌شود.
+
+FRIDGE_UPGRADE_BUTTON_TEXT = "ارتقا سطح یخچال"
+
+
+def fridge_fish_button_position(msg: Message, fish_index: int) -> Tuple[int, int]:
+    """موقعیت (ردیف, ستون) دکمه‌ی آنانیمِ متناظر با fish_index-امین ماهیِ لیست متن."""
+    has_upgrade = get_button(msg, text=FRIDGE_UPGRADE_BUTTON_TEXT) is not None
+    row = 1 if has_upgrade else 0
+    return row, fish_index
 
 
 # ══════════════════════════════════════════════════
@@ -2052,38 +2056,30 @@ def _sync_capacity_from_text(text: str) -> None:
 
 async def fridge_sync_if_empty(group: int) -> None:
     """
-    مورد ۳ سند یخچال: اگر جدول محلی یخچال کاملاً خالی باشد، پیام «یخچال میویی»
-    ارسال و از روی پاسخ، ظرفیت و لیست موجودی فعلی (با وضعیت خام/پخته‌شده) در
-    دیتابیس محلی سینک می‌شود.
+    مورد ۳ سند یخچال: اگر جدول محلی یخچال کاملاً خالی باشد و هنوز سینکی روی این
+    دوره‌ی «روشن بودن» ماژول انجام نشده باشد، پیام «یخچال میویی» ارسال و از روی
+    پاسخ، ظرفیت و لیست موجودی فعلی سینک می‌شود.
 
-    نکته‌ی مهم: اگر یخچالِ واقعی هم واقعاً خالی باشد (هیچ ماهی‌ای برای افزودن
-    نباشد)، جدول محلی طبیعتاً همچنان خالی می‌ماند — و اگر تنها معیار «نیاز به
-    سینک» را «جدول خالی است» بگیریم، این سینک هرگز «انجام‌شده» تلقی نمی‌شود و
-    fridge_loop هر دور دوباره پیام می‌فرستد. برای همین، زمان آخرین تلاش سینک
-    را جدا در کانفیگ (fridge_last_sync_at) ذخیره می‌کنیم و فقط اگر مدتی
-    (fridge_poll_sec) از آخرین تلاش گذشته باشد، دوباره تلاش می‌کنیم.
+    این کار *دقیقاً یک‌بار* در هر دوره‌ی روشن‌بودنِ ماژول انجام می‌شود — چه
+    یخچال واقعی چیزی داشته باشد چه خالی باشد، نتیجه فرقی نمی‌کند: بعد از یک
+    تلاش، پرچم fridge_synced_once ست می‌شود و دیگر تا زمانی که کاربر دوباره
+    «.یخچال خاموش» و «.یخچال روشن» نزند (که fridge_reset_all این پرچم را پاک
+    می‌کند)، هیچ سینک خودکار دیگری انجام نمی‌شود.
     """
+    if cfg_bool("fridge_synced_once", False):
+        return
     if table_count("meow_refrigerator") != 0:
         return
 
-    last_sync = cfg("fridge_last_sync_at", "")
-    poll = cfg_int("fridge_poll_sec", FRIDGE_DEFAULT_POLL)
-    if last_sync:
-        try:
-            if (time.time() - float(last_sync)) < poll:
-                return  # به‌تازگی سینک شده (و نتیجه‌اش خالی بوده) — دوباره تلاش نکن
-        except ValueError:
-            pass
-
-    cfg_set("fridge_last_sync_at", str(time.time()))
+    cfg_bool_set("fridge_synced_once", True)  # قبل از تلاش ست می‌شود تا هرگز دوباره تکرار نشود
 
     sent = await safe_send(group, FRIDGE_TRIGGER)
     if not sent:
-        log.warning(f"[FRIDGE] ارسال «{FRIDGE_TRIGGER}» برای سینک اولیه ناموفق بود.")
+        log.warning(f"[FRIDGE] ارسال «{FRIDGE_TRIGGER}» برای سینک اولیه ناموفق بود — دیگر خودکار تکرار نمی‌شود.")
         return
     msg = await wait_for_bot_message(group, sent.id)
     if not msg:
-        log.warning("[FRIDGE] پاسخی برای سینک اولیه یخچال دریافت نشد.")
+        log.warning("[FRIDGE] پاسخی برای سینک اولیه یخچال دریافت نشد — دیگر خودکار تکرار نمی‌شود.")
         return
 
     text = msg.text or ""
@@ -2106,9 +2102,13 @@ async def fridge_sync_if_empty(group: int) -> None:
 async def fridge_initiate_cook(group: int, emo: str) -> bool:
     """
     مورد ۵ سند یخچال: ورود به گروه یخچال، پیدا کردن دکمه‌ی مربوط به ماهی 'emo'
-    بر اساس ترتیب آن در متن (نه اندیس ثابت — دکمه‌های شیشه‌ای بدون متن به همان
-    ترتیب لیست ماهی‌ها در متن ظاهر می‌شوند و دکمه‌ی «ارتقا سطح یخچال» چون متن
-    دارد از این شمارش کنار گذاشته می‌شود)، کلیک روی آن و سپس تایید شروع پخت.
+    بر اساس ترتیب آن در متن، کلیک روی آن و سپس تایید شروع پخت.
+
+    موقعیت دکمه (طبق تایید صریح کاربر): دکمه‌ها هیچ متنی ندارند و فقط بر اساس
+    «موقعیت» مشخص می‌شوند — نه با اسکن‌کردن پیام برای دکمه‌های خالی:
+      • اگر دکمه‌ی متنیِ «ارتقا سطح یخچال» نبود → ماهیِ اول = (ردیف۰, ستون۰)
+      • اگر آن دکمه بود (ردیف۰ را اشغال کرده) → ماهیِ اول = (ردیف۱, ستون۰)
+    در هر دو حالت، ستون = ایندکس ماهی در لیست متن (fridge_fish_button_position).
     """
     sent = await safe_send(group, FRIDGE_TRIGGER)
     if not sent:
@@ -2137,13 +2137,14 @@ async def fridge_initiate_cook(group: int, emo: str) -> bool:
         log.warning(f"[FRIDGE] ماهی '{emo}' در لیست یخچال پیدا نشد — منتظر سینک بعدی می‌مانیم.")
         return False
 
-    anon_buttons = get_anonymous_buttons_flat(msg)
-    if idx >= len(anon_buttons):
-        log.warning(f"[FRIDGE] دکمه‌ی متناظر با ماهی '{emo}' (ایندکس {idx}) پیدا نشد.")
+    row, col = fridge_fish_button_position(msg, idx)
+    btn = get_button(msg, row=row, col=col)
+    if btn is None:
+        log.warning(f"[FRIDGE] دکمه‌ی متناظر با ماهی '{emo}' در موقعیت (ردیف={row}, ستون={col}) پیدا نشد.")
         return False
 
-    if not await raw_click(msg, anon_buttons[idx]):
-        log.warning(f"[FRIDGE] کلیک روی دکمه‌ی ماهی '{emo}' ناموفق بود.")
+    if not await raw_click(msg, btn):
+        log.warning(f"[FRIDGE] کلیک روی دکمه‌ی ماهی '{emo}' (ردیف={row}, ستون={col}) ناموفق بود.")
         return False
 
     fresh = await refresh_message(group, msg.id)
@@ -2169,9 +2170,10 @@ async def fridge_initiate_cook(group: int, emo: str) -> bool:
 
 async def fridge_collect_cooked(group: int, emo: str) -> bool:
     """
-    مورد ۶ سند یخچال: مجدداً روی دکمه‌ی ماهی 'emo' کلیک می‌کند، وضعیت
-    «پخته‌شده» را تایید می‌کند، ارزش و ارزش‌غذایی تازه را می‌خواند و بر اساس
-    وضعیت شکم گربه و سقف ارزش تنظیم‌شده، ماهی را می‌فروشد یا به گربه می‌دهد.
+    مورد ۶ سند یخچال: مجدداً روی دکمه‌ی ماهی 'emo' کلیک می‌کند (بر اساس همان
+    قانون موقعیت fridge_fish_button_position)، وضعیت «پخته‌شده» را تایید
+    می‌کند، ارزش و ارزش‌غذایی تازه را می‌خواند و بر اساس وضعیت شکم گربه و سقف
+    ارزش تنظیم‌شده، ماهی را می‌فروشد یا به گربه می‌دهد.
     """
     sent = await safe_send(group, FRIDGE_TRIGGER)
     if not sent:
@@ -2200,13 +2202,14 @@ async def fridge_collect_cooked(group: int, emo: str) -> bool:
         log.warning(f"[FRIDGE] ماهی '{emo}' برای جمع‌آوری در لیست پیدا نشد.")
         return False
 
-    anon_buttons = get_anonymous_buttons_flat(msg)
-    if idx >= len(anon_buttons):
-        log.warning(f"[FRIDGE] دکمه‌ی جمع‌آوری ماهی '{emo}' پیدا نشد.")
+    row, col = fridge_fish_button_position(msg, idx)
+    btn = get_button(msg, row=row, col=col)
+    if btn is None:
+        log.warning(f"[FRIDGE] دکمه‌ی جمع‌آوری ماهی '{emo}' در موقعیت (ردیف={row}, ستون={col}) پیدا نشد.")
         return False
 
-    if not await raw_click(msg, anon_buttons[idx]):
-        log.warning(f"[FRIDGE] کلیک روی ماهی پخته‌شده‌ی '{emo}' ناموفق بود.")
+    if not await raw_click(msg, btn):
+        log.warning(f"[FRIDGE] کلیک روی ماهی پخته‌شده‌ی '{emo}' (ردیف={row}, ستون={col}) ناموفق بود.")
         return False
 
     fresh = await refresh_message(group, msg.id)
