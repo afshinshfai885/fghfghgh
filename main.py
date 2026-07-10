@@ -2153,6 +2153,21 @@ async def fridge_initiate_cook(group: int, emo: str) -> bool:
         return False
 
     detail_text = fresh.text or ""
+
+    # اگر متن هنوز به‌روزرسانی نشده (پخیدن شروع نشده)، دنبال جدیدترین پیام بات بگرد
+    if "پخیدن" not in detail_text and "زمان مورد نیاز" not in detail_text:
+        newer = await wait_for_bot_message(group, msg.id, timeout=10)
+        if newer:
+            fresh = newer
+            detail_text = fresh.text or ""
+
+    cook_dur = parse_cook_duration(detail_text)
+    if cook_dur is None:
+        cook_dur = 120
+        log.warning(f"[FRIDGE] زمان پخت برای '{emo}' پارس نشد — از fallback {cook_dur} ثانیه استفاده شد.")
+
+        
+    detail_text = fresh.text or ""
     cook_dur = parse_cook_duration(detail_text)
     if cook_dur is None:
         cook_dur = 120  # fallback ایمن — اگر زمان از متن پارس نشد
@@ -2161,6 +2176,10 @@ async def fridge_initiate_cook(group: int, emo: str) -> bool:
     # تایید شروع پخت: مطابق الگوی موجود در factory_cycle، کلیک «موقعیتی» (۰,۰)
     # اصل ماجراست؛ متن fallback فقط برای مقاومت در برابر جابه‌جایی موقعیت است.
     await click_button(fresh, 2, 0, fallback_text=FRIDGE_COOK_CONFIRM_TEXT)
+
+    confirm_msg = await refresh_message(group, fresh.id)
+    if confirm_msg:
+        await click_button(confirm_msg, 0, 0, fallback_text=None)
 
     now = time.time()
     fridge_set_status(emo, "cooking", cook_started_at=now, cook_ready_at=now + cook_dur)
