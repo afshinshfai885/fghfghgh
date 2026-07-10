@@ -2160,7 +2160,7 @@ async def fridge_initiate_cook(group: int, emo: str) -> bool:
 
     # تایید شروع پخت: مطابق الگوی موجود در factory_cycle، کلیک «موقعیتی» (۰,۰)
     # اصل ماجراست؛ متن fallback فقط برای مقاومت در برابر جابه‌جایی موقعیت است.
-    await click_button(fresh, 0, 0, fallback_text=FRIDGE_COOK_CONFIRM_TEXT)
+    await click_button(fresh, 2, 0, fallback_text=FRIDGE_COOK_CONFIRM_TEXT)
 
     now = time.time()
     fridge_set_status(emo, "cooking", cook_started_at=now, cook_ready_at=now + cook_dur)
