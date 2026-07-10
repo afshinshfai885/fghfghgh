@@ -432,6 +432,7 @@ def fridge_reset_all() -> None:
         with db_cursor() as c:
             c.execute("DELETE FROM meow_refrigerator")
         cfg_set("fridge_capacity_max", "0")
+        cfg_set("fridge_last_sync_at", "")
         log.info("[FRIDGE-DB] دیتابیس محلی یخچال کاملاً پاک شد — سینک کامل در دور بعدی انجام می‌شود.")
     except sqlite3.Error as e:
         log.error(f"[FRIDGE-DB] خطا در پاک‌سازی کامل: {e}")
@@ -2054,9 +2055,27 @@ async def fridge_sync_if_empty(group: int) -> None:
     مورد ۳ سند یخچال: اگر جدول محلی یخچال کاملاً خالی باشد، پیام «یخچال میویی»
     ارسال و از روی پاسخ، ظرفیت و لیست موجودی فعلی (با وضعیت خام/پخته‌شده) در
     دیتابیس محلی سینک می‌شود.
+
+    نکته‌ی مهم: اگر یخچالِ واقعی هم واقعاً خالی باشد (هیچ ماهی‌ای برای افزودن
+    نباشد)، جدول محلی طبیعتاً همچنان خالی می‌ماند — و اگر تنها معیار «نیاز به
+    سینک» را «جدول خالی است» بگیریم، این سینک هرگز «انجام‌شده» تلقی نمی‌شود و
+    fridge_loop هر دور دوباره پیام می‌فرستد. برای همین، زمان آخرین تلاش سینک
+    را جدا در کانفیگ (fridge_last_sync_at) ذخیره می‌کنیم و فقط اگر مدتی
+    (fridge_poll_sec) از آخرین تلاش گذشته باشد، دوباره تلاش می‌کنیم.
     """
     if table_count("meow_refrigerator") != 0:
         return
+
+    last_sync = cfg("fridge_last_sync_at", "")
+    poll = cfg_int("fridge_poll_sec", FRIDGE_DEFAULT_POLL)
+    if last_sync:
+        try:
+            if (time.time() - float(last_sync)) < poll:
+                return  # به‌تازگی سینک شده (و نتیجه‌اش خالی بوده) — دوباره تلاش نکن
+        except ValueError:
+            pass
+
+    cfg_set("fridge_last_sync_at", str(time.time()))
 
     sent = await safe_send(group, FRIDGE_TRIGGER)
     if not sent:
@@ -2069,6 +2088,11 @@ async def fridge_sync_if_empty(group: int) -> None:
 
     text = msg.text or ""
     _sync_capacity_from_text(text)
+
+    if is_fridge_empty(text):
+        log.info("[FRIDGE] سینک انجام شد | یخچال واقعاً خالی است — هیچ ماهی‌ای برای افزودن نبود.")
+        return
+
     entries = parse_fridge_entries(text)
     for e in entries:
         if not e["emoji"]:
