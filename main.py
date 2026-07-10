@@ -206,14 +206,25 @@ def init_db() -> None:
             # مورد ۲ سند یخچال: جدول اختصاصی موجودی یخچال — هر ردیف یعنی یک نوع
             # ماهی/موجود دریایی درون یخچال است (کلید = ایموجی → جلوگیری از تکرار).
             # status: 'raw' (تازه ذخیره‌شده، پخت شروع نشده) | 'cooking' | 'cooked'
+            # miss_count/last_attempt_at: برای جلوگیری از تلاش بی‌وقفه روی ماهی‌ای
+            # که در یخچال واقعی پیدا نمی‌شود (مثلاً به‌خاطر ناهماهنگی دیتابیس محلی).
             c.execute(
                 "CREATE TABLE IF NOT EXISTS meow_refrigerator ("
                 "emoji TEXT PRIMARY KEY, "
                 "status TEXT NOT NULL DEFAULT 'raw', "
                 "added_at REAL NOT NULL, "
                 "cook_started_at REAL, "
-                "cook_ready_at REAL)"
+                "cook_ready_at REAL, "
+                "miss_count INTEGER NOT NULL DEFAULT 0, "
+                "last_attempt_at REAL)"
             )
+            # ALTER TABLE ایمن برای دیتابیس‌هایی که از نسخه‌ی قبلی (بدون این دو
+            # ستون) آپدیت می‌شوند — روی دیتابیس تازه بی‌اثر است (ستون از قبل هست).
+            for col_def in ("miss_count INTEGER NOT NULL DEFAULT 0", "last_attempt_at REAL"):
+                try:
+                    c.execute(f"ALTER TABLE meow_refrigerator ADD COLUMN {col_def}")
+                except sqlite3.OperationalError:
+                    pass  # ستون از قبل وجود دارد
             c.execute("INSERT OR IGNORE INTO cat_stats (id, stomach) VALUES (1, 0)")
 
             for k, v in DEFAULT_CONFIG.items():
@@ -475,6 +486,54 @@ def fridge_next_ready_at() -> Optional[float]:
     except sqlite3.Error as e:
         log.error(f"[FRIDGE-DB] خطا در خواندن نزدیک‌ترین زمان آماده‌شدن: {e}")
         return None
+
+
+FRIDGE_MISS_BACKOFF_SEC = 60   # حداقل فاصله بین دو تلاش متوالی برای همون ماهی بعد از یک شکست
+FRIDGE_MISS_GIVE_UP = 10       # بعد از این تعداد شکست پیاپی، دیگر تلاش خودکار نمی‌شود (نیاز به بررسی دستی)
+
+
+def fridge_should_attempt(emoji: str) -> bool:
+    """
+    آیا الان زمان مناسبی برای تلاش دوباره روی این ماهی هست؟ اگر اخیراً (کمتر از
+    FRIDGE_MISS_BACKOFF_SEC پیش) یک تلاش شکست‌خورده داشته، صبر می‌کنیم تا از
+    درخواست‌های پشت‌سرهم و بی‌فایده به تلگرام جلوگیری شود.
+    """
+    try:
+        with db_cursor() as c:
+            c.execute(
+                "SELECT miss_count, last_attempt_at FROM meow_refrigerator WHERE emoji=?",
+                (emoji,),
+            )
+            row = c.fetchone()
+            if not row:
+                return True
+            miss_count, last_attempt_at = row
+            if miss_count >= FRIDGE_MISS_GIVE_UP:
+                return False
+            if last_attempt_at and (time.time() - last_attempt_at) < FRIDGE_MISS_BACKOFF_SEC:
+                return False
+            return True
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در بررسی زمان تلاش مجدد '{emoji}': {e}")
+        return True
+
+
+def fridge_record_attempt(emoji: str, success: bool) -> None:
+    """ثبت نتیجه‌ی یک تلاش (موفق/ناموفق) روی این ماهی — برای مدیریت backoff."""
+    try:
+        with db_cursor() as c:
+            if success:
+                c.execute(
+                    "UPDATE meow_refrigerator SET miss_count=0, last_attempt_at=? WHERE emoji=?",
+                    (time.time(), emoji),
+                )
+            else:
+                c.execute(
+                    "UPDATE meow_refrigerator SET miss_count=miss_count+1, last_attempt_at=? WHERE emoji=?",
+                    (time.time(), emoji),
+                )
+    except sqlite3.Error as e:
+        log.error(f"[FRIDGE-DB] خطا در ثبت نتیجه‌ی تلاش '{emoji}': {e}")
 
 
 def secs_left(key: str, interval: int) -> float:
@@ -2090,9 +2149,15 @@ async def fridge_collect_cooked(group: int, emo: str) -> bool:
 
 async def fridge_loop() -> None:
     """
-    حلقه‌ی مدیریت کامل چرخه‌ی یخچال میویی. هر دور، وضعیت محلی را از دیتابیس
-    می‌خواند و بر همان اساس تصمیم می‌گیرد: جمع‌آوری ماهیِ آماده > شروع پخت
-    ماهیِ خام > سینک اولیه (اگر جدول خالی بود) > هیچ‌کاری (انتظار).
+    حلقه‌ی مدیریت کامل چرخه‌ی یخچال میویی. هر دور *فقط یک* اقدام انجام می‌دهد
+    (جمع‌آوری، یا شروع پخت، یا سینک) — هرگز بیش از یکی در یک دور، تا از ارسال
+    پی‌درپی چند پیام به گروه یخچال در عرض چند ثانیه جلوگیری شود.
+
+    اگر ماهی‌ای در یخچال واقعی پیدا نشود (ناهماهنگی دیتابیس محلی)، به‌جای تلاش
+    بی‌وقفه در هر دور، یک backoff اعمال می‌شود (fridge_should_attempt) تا حداکثر
+    هر FRIDGE_MISS_BACKOFF_SEC ثانیه یک‌بار دوباره امتحان شود، و بعد از
+    FRIDGE_MISS_GIVE_UP بار شکست پیاپی، دیگر خودکار تلاش نمی‌شود (نیاز به بررسی
+    دستی — احتمالاً یعنی آن ماهی دیگر واقعاً در یخچال بازی وجود ندارد).
     """
     while True:
         if not cfg_bool("refrigerator_enabled", False):
@@ -2105,29 +2170,42 @@ async def fridge_loop() -> None:
             await asyncio.sleep(cfg_int("fridge_poll_sec", FRIDGE_DEFAULT_POLL))
             continue
 
-        handled = False
         try:
-            due_now = fridge_due_now()
+            due_now = [e for e in fridge_due_now() if fridge_should_attempt(e)]
             if due_now:
-                handled = await fridge_collect_cooked(group, due_now[0])
-
-            if not handled:
-                raw_pending = fridge_list_raw()
+                emo = due_now[0]
+                ok = await fridge_collect_cooked(group, emo)
+                fridge_record_attempt(emo, ok)
+                if not ok:
+                    log.warning(
+                        f"[FRIDGE] ماهی '{emo}' در یخچال واقعی پیدا نشد — احتمالاً دیتابیس "
+                        f"محلی با بازی هماهنگ نیست. تا {FRIDGE_MISS_BACKOFF_SEC} ثانیه دیگر "
+                        f"دوباره امتحان می‌شود (حداکثر {FRIDGE_MISS_GIVE_UP} بار)."
+                    )
+            else:
+                raw_pending = [e for e in fridge_list_raw() if fridge_should_attempt(e)]
                 if raw_pending:
-                    handled = await fridge_initiate_cook(group, raw_pending[0])
-
-            if not handled and table_count("meow_refrigerator") == 0:
-                await fridge_sync_if_empty(group)
+                    emo = raw_pending[0]
+                    ok = await fridge_initiate_cook(group, emo)
+                    fridge_record_attempt(emo, ok)
+                    if not ok:
+                        log.warning(
+                            f"[FRIDGE] ماهی '{emo}' برای شروع پخت در یخچال واقعی پیدا نشد — "
+                            f"تا {FRIDGE_MISS_BACKOFF_SEC} ثانیه دیگر دوباره امتحان می‌شود "
+                            f"(حداکثر {FRIDGE_MISS_GIVE_UP} بار)."
+                        )
+                elif table_count("meow_refrigerator") == 0:
+                    await fridge_sync_if_empty(group)
         except Exception as e:
             log.error(f"[FRIDGE] خطای غیرمنتظره در حلقه یخچال: {e}")
 
+        # فاصله‌ی خواب: طبق fridge_poll_sec، مگر این‌که یک پخت واقعاً زودتر آماده شود
         sleep_for = cfg_int("fridge_poll_sec", FRIDGE_DEFAULT_POLL)
-        if not handled:
-            next_ready = fridge_next_ready_at()
-            if next_ready is not None:
-                remaining = next_ready - time.time()
-                if 0 < remaining < sleep_for:
-                    sleep_for = remaining + 2
+        next_ready = fridge_next_ready_at()
+        if next_ready is not None:
+            remaining = next_ready - time.time()
+            if 0 < remaining < sleep_for:
+                sleep_for = remaining + 2
 
         await asyncio.sleep(max(3, sleep_for))
 
