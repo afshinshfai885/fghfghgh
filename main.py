@@ -2188,57 +2188,43 @@ async def fridge_initiate_cook(group: int, emo: str) -> bool:
 
 
 async def fridge_collect_cooked(group: int, emo: str) -> bool:
-    """
-    مورد ۶ سند یخچال: مجدداً روی دکمه‌ی ماهی 'emo' کلیک می‌کند (بر اساس همان
-    قانون موقعیت fridge_fish_button_position)، وضعیت «پخته‌شده» را تایید
-    می‌کند، ارزش و ارزش‌غذایی تازه را می‌خواند و بر اساس وضعیت شکم گربه و سقف
-    ارزش تنظیم‌شده، ماهی را می‌فروشد یا به گربه می‌دهد.
-    """
+    """جمع‌آوری ماهی پخته‌شده + تصمیم فروش یا تغذیه"""
     sent = await safe_send(group, FRIDGE_TRIGGER)
     if not sent:
-        log.warning(f"[FRIDGE] ارسال «{FRIDGE_TRIGGER}» برای جمع‌آوری ناموفق بود.")
+        log.warning(f"[FRIDGE] ارسال پیام یخچال ناموفق")
         return False
 
     msg = await wait_for_bot_message(group, sent.id)
     if not msg:
-        log.warning("[FRIDGE] پاسخی برای جمع‌آوری ماهی پخته‌شده دریافت نشد.")
         return False
 
     listing_text = msg.text or ""
     _sync_capacity_from_text(listing_text)
 
     if is_fridge_empty(listing_text):
-        log.warning(
-            f"[FRIDGE] یخچال واقعی خالی است ولی دیتابیس محلی ماهی '{emo}' را دارد — "
-            f"رکورد محلی ناهماهنگ حذف شد (خودترمیمی)."
-        )
+        log.warning(f"[FRIDGE] ماهی '{emo}' دیگر در یخچال نیست — حذف محلی")
         fridge_remove(emo)
         return False
 
     entries = parse_fridge_entries(listing_text)
     idx = next((i for i, e in enumerate(entries) if e["emoji"] == emo), None)
     if idx is None:
-        log.warning(f"[FRIDGE] ماهی '{emo}' برای جمع‌آوری در لیست پیدا نشد.")
+        log.warning(f"[FRIDGE] ماهی '{emo}' در لیست پیدا نشد")
         return False
 
+    # باز کردن صفحه ماهی
     row, col = fridge_fish_button_position(msg, idx)
-    btn = get_button(msg, row=row, col=col)
-    if btn is None:
-        log.warning(f"[FRIDGE] دکمه‌ی جمع‌آوری ماهی '{emo}' در موقعیت (ردیف={row}, ستون={col}) پیدا نشد.")
+    if not await raw_click(msg, get_button(msg, row=row, col=col)):
+        log.warning(f"[FRIDGE] کلیک روی ماهی '{emo}' ناموفق")
         return False
 
-    if not await raw_click(msg, btn):
-        log.warning(f"[FRIDGE] کلیک روی ماهی پخته‌شده‌ی '{emo}' (ردیف={row}, ستون={col}) ناموفق بود.")
-        return False
-
-    fresh = await refresh_message(group, msg.id)
+    fresh = await refresh_message(group, msg.id, tries=8, delay=0.8)
     if not fresh:
-        log.warning("[FRIDGE] پیام صفحه‌ی ماهی پخته‌شده دریافت نشد.")
         return False
 
     detail_text = fresh.text or ""
     if not is_cooked_label(detail_text):
-        log.info(f"[FRIDGE] ماهی '{emo}' هنوز به‌عنوان پخته‌شده تایید نشد — این دور رد شد.")
+        log.info(f"[FRIDGE] ماهی هنوز پخته نشده")
         return False
 
     fish_value = parse_fish_value(detail_text)
@@ -2247,16 +2233,35 @@ async def fridge_collect_cooked(group: int, emo: str) -> bool:
     value_threshold = cfg_int("refrigerator_fish_value_max", 5000)
 
     feed = (stomach < stomach_threshold) and (fish_value is not None and fish_value < value_threshold)
-    target_btn = GIVE_TO_CAT_BUTTON if feed else SELL_FISH_BUTTON
+    target_btn_text = GIVE_TO_CAT_BUTTON if feed else SELL_FISH_BUTTON
 
     log.info(
-        f"[FRIDGE] ماهی '{emo}' پخته شد | ارزش={fish_value} (سقف تغذیه={value_threshold}) "
-        f"| شکم={stomach} (آستانه={stomach_threshold}) → '{target_btn}'"
+        f"[FRIDGE] ماهی '{emo}' آماده | ارزش={fish_value} | شکم={stomach} → "
+        f"{'تغذیه' if feed else 'فروش'}"
     )
 
-    await click_by_text(fresh, target_btn)
-    fridge_remove(emo)
-    return True
+    # === کلیک موقعیتی (قوی‌تر) ===
+    success = False
+    
+    if feed:
+        # بده پیشی بخوره → ردیف 1، ستون 0
+        success = await click_button(fresh, 1, 0)
+    else:
+        # فروش ماهی → ردیف 0، ستون 0
+        success = await click_button(fresh, 0, 0)
+
+    # fallback متنی در صورت شکست
+    if not success:
+        success = await click_by_text(fresh, target_btn_text)
+
+    if success:
+        log.info(f"[FRIDGE] ✅ اقدام موفق: {target_btn_text}")
+        fridge_remove(emo)
+        return True
+    else:
+        log.error(f"[FRIDGE] ❌ هر دو روش کلیک (موقعیتی + متنی) شکست خورد برای '{target_btn_text}'")
+        # ماهی را حذف نمی‌کنیم تا دور بعدی دوباره تلاش کند
+        return False
 
 
 async def fridge_loop() -> None:
